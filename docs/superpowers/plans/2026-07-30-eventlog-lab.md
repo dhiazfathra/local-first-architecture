@@ -5676,3 +5676,3203 @@ git commit -m "feat(eventlog): Postgres central store with reporting projection"
 ```
 
 ---
+
+### Task 11: `internal/jepsenlite/` — the seven faults
+
+The harness is the product of this project, and this task builds its fault
+apparatus: one type per injection mechanism, nothing else. No scheduling, no
+property checking — those are Tasks 12 and 13, so a reviewer can reject a fault
+mechanism without re-reading the simulator.
+
+**Files:**
+- Create: `eventlog-lab/internal/jepsenlite/transport.go`
+- Test: `eventlog-lab/internal/jepsenlite/transport_test.go`
+
+**Interfaces:**
+- Consumes: `clock.NodeID`, `clock.WallFunc` (Tasks 1-2); `eventlog.OpenSQLite`, `*eventlog.SQLiteLog`, `eventlog.Event`, `eventlog.Seq`, `eventlog.VersionVector` (Tasks 3-4); `crdt.SQLLog` (Task 6); `syncpb.ClientFrame`, `syncpb.ServerFrame` (Task 8); `sync.FrameFilter` shape `func(from, to clock.NodeID, frame any) []any` (Task 9).
+- Produces:
+  - `type Faults struct { Partition, AsymPartition, ClockSkew, Duplicate, Reorder, CrashMidAppend, SlowPeer bool }`
+  - `func ParseFaults(csv string) (Faults, error)` — accepts `partition,asym,skew,dup,reorder,crash,slow`, plus `all` and `""`.
+  - `func (f Faults) Names() []string` — sorted canonical names, for reports.
+  - `type Stats struct { Dropped, Duplicated, Reordered int }`
+  - `type Injector struct { … }` with
+    `func NewInjector(rng *rand.Rand, f Faults) *Injector`,
+    `func (in *Injector) Filter(from, to clock.NodeID, frame any) []any`,
+    `func (in *Injector) Partition(a, b clock.NodeID)`,
+    `func (in *Injector) PartitionOneWay(from, to clock.NodeID)`,
+    `func (in *Injector) Heal()`,
+    `func (in *Injector) Stats() Stats`
+  - `var ErrCrash error`
+  - `type CrashLog struct { … }` implementing `crdt.SQLLog`, with
+    `func OpenCrashLog(dsn string) (*CrashLog, error)`,
+    `func (c *CrashLog) Arm()`,
+    `func (c *CrashLog) Crashes() int`
+  - `func NewWall(start, skew int64, jumpEvery int, jumpBy int64) clock.WallFunc`
+
+**Domain notes for the implementer:**
+
+- The seven faults from the spec map onto exactly three seams, and no others:
+  - **Transport seam** (`Injector.Filter`, installed via `sync.MemoryTransport.SetFilter`): partition, asymmetric partition, duplicate delivery, reorder. `MemoryTransport` addresses are node IDs verbatim, so the filter's `from`/`to` arguments *are* node IDs.
+  - **Storage seam** (`CrashLog`): crash mid-append.
+  - **Clock seam** (`NewWall`, passed as `node.Config.Wall`): clock skew including backwards jumps.
+  - **Scheduling seam** (Task 12/13): slow peer.
+- **Determinism is non-negotiable.** Every random decision comes from the single `*rand.Rand` the caller seeds. Never call the package-level `rand` functions, never read the wall clock, never spawn a goroutine whose interleaving affects the outcome. A failure must be reproducible from its seed alone.
+- **Only `Events` frames may be dropped-into-oblivion, duplicated, or reordered.** Duplicating a `Hello` or swallowing an `Ack` desynchronises the half-duplex state machine into a deadlock, which is a bug in the harness, not a discovered bug in the system. Duplicated and reordered `Events` batches are exactly what `Append`'s primary key and `Apply`'s commutativity are supposed to absorb, so that is where the interesting pressure is. A partition *does* drop every frame kind — that is a real network partition, and the session is expected to fail and be retried, not to survive.
+- **Reorder holds at most one frame, and only an `Events` frame.** The protocol guarantees at least one more frame follows any `Events` frame in the same direction (another batch, or the terminating `Ack`), so a held frame is always released inside the same session turn. Holding anything else, or holding two, can block a peer that is parked in `Recv` — the harness would hang instead of reporting.
+- **Slow peer is a scheduling fault, not a frame filter.** The spec describes the mechanism as "delays acks past the next batch". Implementing that literally in the filter means withholding an `Ack` the peer is synchronously waiting for, which deadlocks rather than delays. The observable effect — a peer whose acknowledgement lands after other nodes have already exchanged the next batch — is produced instead by ordering the slow node's sync session last in every round (Task 13). Same pressure on the protocol, no deadlock, still deterministic.
+- **`CrashLog` models a crash between `Seq` allocation and insert.** When armed, `AppendLocal` aborts without inserting, closes the database, and reopens it — then returns `ErrCrash`. Because Task 4 allocates `Seq` inside the insert transaction, the reopened log must show *no* gap and *no* partial event. The op returns an error, so per the spec it was never acknowledged and the "no lost event" property does not cover it.
+
+- [ ] **Step 1: Write the failing fault tests**
+
+`eventlog-lab/internal/jepsenlite/transport_test.go`:
+
+```go
+package jepsenlite
+
+import (
+	"context"
+	"errors"
+	"math/rand"
+	"path/filepath"
+	"testing"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/eventlog"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/sync/syncpb"
+)
+
+func eventsFrame() *syncpb.ClientFrame {
+	return &syncpb.ClientFrame{Body: &syncpb.ClientFrame_Events{
+		Events: &syncpb.Events{Events: []*syncpb.Event{{NodeId: "A", Seq: 1}}},
+	}}
+}
+
+func helloFrame() *syncpb.ClientFrame {
+	return &syncpb.ClientFrame{Body: &syncpb.ClientFrame_Hello{
+		Hello: &syncpb.Hello{NodeId: "A"},
+	}}
+}
+
+func TestParseFaults(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    Faults
+		wantErr bool
+	}{
+		{name: "empty is no faults", in: "", want: Faults{}},
+		{name: "single", in: "partition", want: Faults{Partition: true}},
+		{
+			name: "composed with spaces",
+			in:   "partition, skew ,dup",
+			want: Faults{Partition: true, ClockSkew: true, Duplicate: true},
+		},
+		{
+			name: "all enables every fault",
+			in:   "all",
+			want: Faults{
+				Partition: true, AsymPartition: true, ClockSkew: true,
+				Duplicate: true, Reorder: true, CrashMidAppend: true, SlowPeer: true,
+			},
+		},
+		{name: "unknown name", in: "gremlins", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseFaults(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseFaults(%q) error = nil, want error", tt.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseFaults(%q) error = %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("ParseFaults(%q) = %+v, want %+v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFaultsNames(t *testing.T) {
+	got := Faults{Partition: true, Reorder: true}.Names()
+	want := []string{"partition", "reorder"}
+	if len(got) != len(want) {
+		t.Fatalf("Names() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Names() = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestInjectorPartitionDropsBothDirections(t *testing.T) {
+	in := NewInjector(rand.New(rand.NewSource(1)), Faults{Partition: true})
+	in.Partition("A", "B")
+
+	if out := in.Filter("A", "B", helloFrame()); out != nil {
+		t.Errorf("Filter(A->B) = %v, want nil (dropped)", out)
+	}
+	if out := in.Filter("B", "A", helloFrame()); out != nil {
+		t.Errorf("Filter(B->A) = %v, want nil (dropped)", out)
+	}
+	if out := in.Filter("A", "C", helloFrame()); len(out) != 1 {
+		t.Errorf("Filter(A->C) len = %d, want 1 (unaffected pair)", len(out))
+	}
+	if got := in.Stats().Dropped; got != 2 {
+		t.Errorf("Stats().Dropped = %d, want 2", got)
+	}
+
+	in.Heal()
+	if out := in.Filter("A", "B", helloFrame()); len(out) != 1 {
+		t.Errorf("after Heal, Filter(A->B) len = %d, want 1", len(out))
+	}
+}
+
+func TestInjectorAsymmetricPartitionDropsOneDirection(t *testing.T) {
+	in := NewInjector(rand.New(rand.NewSource(2)), Faults{AsymPartition: true})
+	in.PartitionOneWay("A", "B")
+
+	if out := in.Filter("A", "B", helloFrame()); out != nil {
+		t.Errorf("Filter(A->B) = %v, want nil (dropped)", out)
+	}
+	if out := in.Filter("B", "A", helloFrame()); len(out) != 1 {
+		t.Errorf("Filter(B->A) len = %d, want 1 (reverse must survive)", len(out))
+	}
+}
+
+func TestInjectorDuplicateOnlyDuplicatesEventsFrames(t *testing.T) {
+	in := NewInjector(rand.New(rand.NewSource(3)), Faults{Duplicate: true})
+
+	// Prime the prior-frame memory, then drive frames until a duplicate appears.
+	dupSeen := false
+	for i := 0; i < 200 && !dupSeen; i++ {
+		if len(in.Filter("A", "B", eventsFrame())) == 2 {
+			dupSeen = true
+		}
+	}
+	if !dupSeen {
+		t.Fatalf("no duplicate produced in 200 Events frames; rng wiring is wrong")
+	}
+	if got := in.Stats().Duplicated; got == 0 {
+		t.Errorf("Stats().Duplicated = 0, want > 0")
+	}
+	for i := 0; i < 200; i++ {
+		if got := len(in.Filter("A", "B", helloFrame())); got != 1 {
+			t.Fatalf("Hello frame duplicated (len = %d); only Events may duplicate", got)
+		}
+	}
+}
+
+func TestInjectorReorderHoldsOneEventsFrameThenReleasesBoth(t *testing.T) {
+	in := NewInjector(rand.New(rand.NewSource(4)), Faults{Reorder: true})
+
+	held := false
+	for i := 0; i < 200; i++ {
+		out := in.Filter("A", "B", eventsFrame())
+		if len(out) == 0 {
+			held = true
+			// The very next frame must flush the held one plus itself.
+			next := in.Filter("A", "B", eventsFrame())
+			if len(next) != 2 {
+				t.Fatalf("after holding, next Filter len = %d, want 2", len(next))
+			}
+			break
+		}
+	}
+	if !held {
+		t.Fatalf("reorder never held a frame in 200 attempts; rng wiring is wrong")
+	}
+	if got := in.Stats().Reordered; got == 0 {
+		t.Errorf("Stats().Reordered = 0, want > 0")
+	}
+}
+
+func TestInjectorReorderNeverHoldsNonEventsFrames(t *testing.T) {
+	in := NewInjector(rand.New(rand.NewSource(5)), Faults{Reorder: true})
+	for i := 0; i < 200; i++ {
+		if got := len(in.Filter("A", "B", helloFrame())); got != 1 {
+			t.Fatalf("Hello frame held (len = %d); would deadlock a parked Recv", got)
+		}
+	}
+}
+
+func TestInjectorDisabledFaultsArePassThrough(t *testing.T) {
+	in := NewInjector(rand.New(rand.NewSource(6)), Faults{})
+	in.Partition("A", "B")
+	for i := 0; i < 100; i++ {
+		if got := len(in.Filter("A", "B", eventsFrame())); got != 1 {
+			t.Fatalf("Filter len = %d with all faults off, want 1", got)
+		}
+	}
+	if in.Stats() != (Stats{}) {
+		t.Errorf("Stats() = %+v, want zero", in.Stats())
+	}
+}
+
+func TestInjectorServerFramesAreClassifiedToo(t *testing.T) {
+	in := NewInjector(rand.New(rand.NewSource(7)), Faults{Duplicate: true})
+	sf := &syncpb.ServerFrame{Body: &syncpb.ServerFrame_Events{
+		Events: &syncpb.Events{Events: []*syncpb.Event{{NodeId: "B", Seq: 1}}},
+	}}
+	dupSeen := false
+	for i := 0; i < 200 && !dupSeen; i++ {
+		if len(in.Filter("B", "A", sf)) == 2 {
+			dupSeen = true
+		}
+	}
+	if !dupSeen {
+		t.Fatalf("ServerFrame Events never duplicated; isEvents does not handle ServerFrame")
+	}
+}
+
+func TestCrashLogAbortsAppendLeavesNoGapAndReopens(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "crash.db")
+	c, err := OpenCrashLog(dsn)
+	if err != nil {
+		t.Fatalf("OpenCrashLog() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	mint := func(s eventlog.Seq) eventlog.Event {
+		return eventlog.Event{
+			ID:    eventlog.EventID{NodeID: "A", Seq: s},
+			HLC:   clock.HLC{Wall: 1, NodeID: "A"},
+			SKU:   "SKU-1",
+			Kind:  eventlog.KindQuantityDelta,
+			Delta: 1,
+		}
+	}
+	if _, err := c.AppendLocal(ctx, mint); err != nil {
+		t.Fatalf("AppendLocal() error = %v", err)
+	}
+
+	c.Arm()
+	if _, err := c.AppendLocal(ctx, mint); !errors.Is(err, ErrCrash) {
+		t.Fatalf("armed AppendLocal() error = %v, want ErrCrash", err)
+	}
+	if got := c.Crashes(); got != 1 {
+		t.Errorf("Crashes() = %d, want 1", got)
+	}
+
+	// The reopened database must show the first event and nothing else -- no
+	// burned sequence number, no half-written row.
+	vv, err := c.VersionVector(ctx)
+	if err != nil {
+		t.Fatalf("VersionVector() after crash error = %v", err)
+	}
+	if vv["A"] != 1 {
+		t.Errorf("VersionVector()[A] = %d, want 1 (no gap after crash)", vv["A"])
+	}
+
+	// The log is usable again and the next Seq is 2, not 3.
+	e, err := c.AppendLocal(ctx, mint)
+	if err != nil {
+		t.Fatalf("AppendLocal() after crash error = %v", err)
+	}
+	if e.ID.Seq != 2 {
+		t.Errorf("Seq after crash = %d, want 2", e.ID.Seq)
+	}
+}
+
+func TestCrashLogArmIsOneShot(t *testing.T) {
+	ctx := context.Background()
+	c, err := OpenCrashLog(filepath.Join(t.TempDir(), "oneshot.db"))
+	if err != nil {
+		t.Fatalf("OpenCrashLog() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	mint := func(s eventlog.Seq) eventlog.Event {
+		return eventlog.Event{
+			ID:    eventlog.EventID{NodeID: "A", Seq: s},
+			HLC:   clock.HLC{Wall: 1, NodeID: "A"},
+			SKU:   "SKU-1",
+			Kind:  eventlog.KindQuantityDelta,
+			Delta: 1,
+		}
+	}
+	c.Arm()
+	if _, err := c.AppendLocal(ctx, mint); !errors.Is(err, ErrCrash) {
+		t.Fatalf("first armed AppendLocal() error = %v, want ErrCrash", err)
+	}
+	if _, err := c.AppendLocal(ctx, mint); err != nil {
+		t.Fatalf("second AppendLocal() error = %v, want nil (Arm is one-shot)", err)
+	}
+}
+
+func TestCrashLogDelegatesEverySQLLogMethod(t *testing.T) {
+	ctx := context.Background()
+	c, err := OpenCrashLog(filepath.Join(t.TempDir(), "delegate.db"))
+	if err != nil {
+		t.Fatalf("OpenCrashLog() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	e := eventlog.Event{
+		ID:    eventlog.EventID{NodeID: "B", Seq: 1},
+		HLC:   clock.HLC{Wall: 5, NodeID: "B"},
+		SKU:   "SKU-9",
+		Kind:  eventlog.KindQuantityDelta,
+		Delta: 4,
+	}
+	if err := c.Append(ctx, e); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	n := 0
+	for range c.Since(ctx, eventlog.VersionVector{}) {
+		n++
+	}
+	if n != 1 {
+		t.Errorf("Since() yielded %d events, want 1", n)
+	}
+	n = 0
+	for range c.EventsForSKU(ctx, "SKU-9", eventlog.VersionVector{}) {
+		n++
+	}
+	if n != 1 {
+		t.Errorf("EventsForSKU() yielded %d events, want 1", n)
+	}
+	if got, err := c.CountForSKU(ctx, "SKU-9"); err != nil || got != 1 {
+		t.Errorf("CountForSKU() = %d, %v, want 1, nil", got, err)
+	}
+	if err := c.SaveSnapshot(ctx, "SKU-9", []byte(`{}`), eventlog.VersionVector{"B": 1}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	state, covers, err := c.LoadSnapshot(ctx, "SKU-9")
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if string(state) != `{}` || covers["B"] != 1 {
+		t.Errorf("LoadSnapshot() = %q, %v, want \"{}\", {B:1}", state, covers)
+	}
+	if err := c.SetCursor(ctx, "A", 7); err != nil {
+		t.Fatalf("SetCursor() error = %v", err)
+	}
+	if got, err := c.Cursor(ctx, "A"); err != nil || got != 7 {
+		t.Errorf("Cursor() = %d, %v, want 7, nil", got, err)
+	}
+	if err := c.Compact(ctx, eventlog.VersionVector{"B": 1}); err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+}
+
+func TestNewWallSkewAndBackwardsJumps(t *testing.T) {
+	tests := []struct {
+		name      string
+		start     int64
+		skew      int64
+		jumpEvery int
+		jumpBy    int64
+		calls     int
+		want      []int64
+	}{
+		{
+			name:  "no skew advances one milli per call",
+			start: 100, calls: 3,
+			want: []int64{100, 101, 102},
+		},
+		{
+			name:  "positive skew is a constant offset",
+			start: 100, skew: 5000, calls: 2,
+			want: []int64{5100, 5101},
+		},
+		{
+			name:  "negative skew is a constant offset",
+			start: 100, skew: -50, calls: 2,
+			want: []int64{50, 51},
+		},
+		{
+			name:  "backwards jump every third call",
+			start: 100, jumpEvery: 3, jumpBy: 30, calls: 6,
+			want: []int64{100, 101, 72, 73, 74, 45},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := NewWall(tt.start, tt.skew, tt.jumpEvery, tt.jumpBy)
+			for i, want := range tt.want {
+				if got := w(); got != want {
+					t.Fatalf("call %d = %d, want %d", i+1, got, want)
+				}
+			}
+		})
+	}
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd eventlog-lab && go test ./internal/jepsenlite/ -v`
+Expected: FAIL to build — `undefined: ParseFaults`, `undefined: NewInjector`, `undefined: OpenCrashLog`, `undefined: NewWall`, `undefined: ErrCrash`.
+
+- [ ] **Step 3: Write the implementation**
+
+`eventlog-lab/internal/jepsenlite/transport.go`:
+
+```go
+// Package jepsenlite is a deterministic fault-injection simulator for the
+// eventlog-lab replication stack. It is the actual product of this project:
+// everything else exists so that this package can try to break it.
+//
+// Every random decision comes from a single seeded *rand.Rand, so a failing run
+// is reproducible from its seed alone.
+package jepsenlite
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"iter"
+	"math/rand"
+	"sort"
+	"strings"
+	stdsync "sync"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/eventlog"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/sync/syncpb"
+)
+
+// Faults enumerates the seven fault kinds from the spec. Each is independently
+// togglable and they compose freely -- the zero value injects nothing.
+type Faults struct {
+	Partition      bool // transport drops frames between a node pair
+	AsymPartition  bool // transport drops one direction only
+	ClockSkew      bool // per-node wall offset, including backwards jumps
+	Duplicate      bool // transport re-sends a prior Events frame
+	Reorder        bool // transport buffers and permutes Events frames
+	CrashMidAppend bool // log aborts the transaction, then reopens the DB
+	SlowPeer       bool // one node's acks land after the next batch
+}
+
+// faultFields maps the canonical CLI name of each fault to its field, so
+// parsing, naming, and iteration all share one table (DRY).
+var faultFields = []struct {
+	name string
+	get  func(*Faults) *bool
+}{
+	{"asym", func(f *Faults) *bool { return &f.AsymPartition }},
+	{"crash", func(f *Faults) *bool { return &f.CrashMidAppend }},
+	{"dup", func(f *Faults) *bool { return &f.Duplicate }},
+	{"partition", func(f *Faults) *bool { return &f.Partition }},
+	{"reorder", func(f *Faults) *bool { return &f.Reorder }},
+	{"skew", func(f *Faults) *bool { return &f.ClockSkew }},
+	{"slow", func(f *Faults) *bool { return &f.SlowPeer }},
+}
+
+// ParseFaults parses a comma-separated fault list. "" means no faults, "all"
+// means every fault.
+func ParseFaults(csv string) (Faults, error) {
+	var f Faults
+	for _, raw := range strings.Split(csv, ",") {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if name == "all" {
+			for _, ff := range faultFields {
+				*ff.get(&f) = true
+			}
+			continue
+		}
+		matched := false
+		for _, ff := range faultFields {
+			if ff.name == name {
+				*ff.get(&f) = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			known := make([]string, 0, len(faultFields))
+			for _, ff := range faultFields {
+				known = append(known, ff.name)
+			}
+			return Faults{}, fmt.Errorf("unknown fault %q; known: %s, all",
+				name, strings.Join(known, ", "))
+		}
+	}
+	return f, nil
+}
+
+// Names returns the sorted canonical names of the enabled faults.
+func (f Faults) Names() []string {
+	out := []string{}
+	for _, ff := range faultFields {
+		if *ff.get(&f) {
+			out = append(out, ff.name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Stats counts what the transport seam actually did during a run.
+type Stats struct {
+	Dropped    int
+	Duplicated int
+	Reordered  int
+}
+
+type link struct{ from, to clock.NodeID }
+
+// Injector is the transport-seam fault source. Install it with
+// sync.MemoryTransport.SetFilter(in.Filter); MemoryTransport addresses are node
+// IDs verbatim, so Filter's from/to arguments are node IDs.
+//
+// Only Events frames are duplicated or reordered. Duplicating a Hello or
+// withholding an Ack desynchronises the half-duplex session into a deadlock,
+// which would be a harness bug rather than a discovered system bug. A partition
+// drops every frame kind, because that is what a real partition does.
+type Injector struct {
+	mu      stdsync.Mutex
+	rng     *rand.Rand
+	faults  Faults
+	blocked map[link]bool
+	prior   map[link]any
+	held    map[link]any
+	stats   Stats
+}
+
+// NewInjector returns an Injector drawing every decision from rng.
+func NewInjector(rng *rand.Rand, f Faults) *Injector {
+	return &Injector{
+		rng:     rng,
+		faults:  f,
+		blocked: map[link]bool{},
+		prior:   map[link]any{},
+		held:    map[link]any{},
+	}
+}
+
+// Partition drops frames in both directions between a and b. It is a no-op
+// unless Faults.Partition is set.
+func (in *Injector) Partition(a, b clock.NodeID) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if !in.faults.Partition {
+		return
+	}
+	in.blocked[link{a, b}] = true
+	in.blocked[link{b, a}] = true
+}
+
+// PartitionOneWay drops frames from -> to only. It is a no-op unless
+// Faults.AsymPartition is set.
+func (in *Injector) PartitionOneWay(from, to clock.NodeID) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if !in.faults.AsymPartition {
+		return
+	}
+	in.blocked[link{from, to}] = true
+}
+
+// Heal removes every partition. Quiescence requires a healed network.
+func (in *Injector) Heal() {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	in.blocked = map[link]bool{}
+}
+
+// Stats returns a snapshot of the injection counters.
+func (in *Injector) Stats() Stats {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.stats
+}
+
+// Filter implements sync.FrameFilter: it maps one outbound frame to the frames
+// actually delivered. Returning an empty slice drops (or holds) the frame.
+func (in *Injector) Filter(from, to clock.NodeID, frame any) []any {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+
+	l := link{from, to}
+	if in.blocked[l] {
+		in.stats.Dropped++
+		return nil
+	}
+
+	out := []any{frame}
+
+	if in.faults.Duplicate && isEvents(frame) && in.rng.Intn(3) == 0 {
+		if p, ok := in.prior[l]; ok {
+			out = append(out, p)
+			in.stats.Duplicated++
+		}
+	}
+	if isEvents(frame) {
+		in.prior[l] = frame
+	}
+
+	if in.faults.Reorder && isEvents(frame) {
+		// Hold at most one Events frame. The protocol always sends another
+		// frame in the same direction afterwards (a further batch, or the
+		// terminating Ack), so a held frame is always released in the same
+		// turn and no peer can be left parked in Recv.
+		if h, ok := in.held[l]; ok {
+			delete(in.held, l)
+			out = append(out, h)
+		} else if in.rng.Intn(3) == 0 {
+			in.held[l] = frame
+			in.stats.Reordered++
+			return nil
+		}
+	}
+	return out
+}
+
+// isEvents reports whether frame carries an Events batch, for either direction.
+func isEvents(frame any) bool {
+	switch f := frame.(type) {
+	case *syncpb.ClientFrame:
+		return f.GetEvents() != nil
+	case *syncpb.ServerFrame:
+		return f.GetEvents() != nil
+	default:
+		return false
+	}
+}
+
+// ErrCrash is returned by an armed CrashLog's AppendLocal.
+var ErrCrash = errors.New("jepsenlite: injected crash mid-append")
+
+// CrashLog wraps a SQLite log and can abort exactly one local append, then
+// reopen the database -- the storage-seam model of a process dying between Seq
+// allocation and insert. Because eventlog allocates Seq inside the insert
+// transaction, the reopened log must show no gap and no partial row.
+//
+// It implements crdt.SQLLog, so a node cannot tell it apart from a real log.
+type CrashLog struct {
+	mu      stdsync.Mutex
+	dsn     string
+	inner   *eventlog.SQLiteLog
+	armed   bool
+	crashes int
+}
+
+// OpenCrashLog opens dsn as a SQLite log wrapped for crash injection. dsn must
+// be a file path: an in-memory database cannot survive the reopen.
+func OpenCrashLog(dsn string) (*CrashLog, error) {
+	l, err := eventlog.OpenSQLite(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open crash log %q: %w", dsn, err)
+	}
+	return &CrashLog{dsn: dsn, inner: l}, nil
+}
+
+// Arm makes the next AppendLocal crash. One-shot.
+func (c *CrashLog) Arm() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.armed = true
+}
+
+// Crashes returns how many injected crashes have fired.
+func (c *CrashLog) Crashes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.crashes
+}
+
+// AppendLocal aborts and reopens the database when armed, otherwise delegates.
+func (c *CrashLog) AppendLocal(ctx context.Context, mint func(eventlog.Seq) eventlog.Event) (eventlog.Event, error) {
+	c.mu.Lock()
+	if c.armed {
+		c.armed = false
+		c.crashes++
+		// Never reached the insert: close and reopen, exactly as a restarted
+		// process would.
+		closeErr := c.inner.Close()
+		l, err := eventlog.OpenSQLite(c.dsn)
+		c.mu.Unlock()
+		if err != nil {
+			return eventlog.Event{}, fmt.Errorf("reopen after injected crash: %w", err)
+		}
+		c.mu.Lock()
+		c.inner = l
+		c.mu.Unlock()
+		if closeErr != nil {
+			return eventlog.Event{}, fmt.Errorf("%w (close: %v)", ErrCrash, closeErr)
+		}
+		return eventlog.Event{}, ErrCrash
+	}
+	inner := c.inner
+	c.mu.Unlock()
+	return inner.AppendLocal(ctx, mint)
+}
+
+// current returns the live inner log under the lock.
+func (c *CrashLog) current() *eventlog.SQLiteLog {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner
+}
+
+// Append delegates to the live log.
+func (c *CrashLog) Append(ctx context.Context, e eventlog.Event) error {
+	return c.current().Append(ctx, e)
+}
+
+// Since delegates to the live log.
+func (c *CrashLog) Since(ctx context.Context, vv eventlog.VersionVector) iter.Seq2[eventlog.Event, error] {
+	return c.current().Since(ctx, vv)
+}
+
+// EventsForSKU delegates to the live log.
+func (c *CrashLog) EventsForSKU(ctx context.Context, sku string, after eventlog.VersionVector) iter.Seq2[eventlog.Event, error] {
+	return c.current().EventsForSKU(ctx, sku, after)
+}
+
+// CountForSKU delegates to the live log.
+func (c *CrashLog) CountForSKU(ctx context.Context, sku string) (int, error) {
+	return c.current().CountForSKU(ctx, sku)
+}
+
+// VersionVector delegates to the live log.
+func (c *CrashLog) VersionVector(ctx context.Context) (eventlog.VersionVector, error) {
+	return c.current().VersionVector(ctx)
+}
+
+// LoadSnapshot delegates to the live log.
+func (c *CrashLog) LoadSnapshot(ctx context.Context, sku string) ([]byte, eventlog.VersionVector, error) {
+	return c.current().LoadSnapshot(ctx, sku)
+}
+
+// SaveSnapshot delegates to the live log.
+func (c *CrashLog) SaveSnapshot(ctx context.Context, sku string, state []byte, covers eventlog.VersionVector) error {
+	return c.current().SaveSnapshot(ctx, sku, state, covers)
+}
+
+// Cursor delegates to the live log.
+func (c *CrashLog) Cursor(ctx context.Context, peer clock.NodeID) (eventlog.Seq, error) {
+	return c.current().Cursor(ctx, peer)
+}
+
+// SetCursor delegates to the live log.
+func (c *CrashLog) SetCursor(ctx context.Context, peer clock.NodeID, last eventlog.Seq) error {
+	return c.current().SetCursor(ctx, peer, last)
+}
+
+// Compact delegates to the live log.
+func (c *CrashLog) Compact(ctx context.Context, upTo eventlog.VersionVector) error {
+	return c.current().Compact(ctx, upTo)
+}
+
+// Close delegates to the live log.
+func (c *CrashLog) Close() error {
+	return c.current().Close()
+}
+
+// NewWall returns a deterministic clock.WallFunc for the clock seam. It starts
+// at start+skew and advances one millisecond per call. When jumpEvery > 0, every
+// jumpEvery-th call jumps backwards by jumpBy milliseconds -- the NTP-correction
+// fault. clock.Clock.Now must stay monotonic across such a jump.
+func NewWall(start, skew int64, jumpEvery int, jumpBy int64) clock.WallFunc {
+	now := start + skew
+	calls := 0
+	return func() int64 {
+		calls++
+		if jumpEvery > 0 && calls%jumpEvery == 0 {
+			now -= jumpBy
+		}
+		v := now
+		now++
+		return v
+	}
+}
+```
+
+- [ ] **Step 4: Assert the type contract at compile time**
+
+Append to `eventlog-lab/internal/jepsenlite/transport.go`:
+
+```go
+// CrashLog must be substitutable for a real log wherever a node expects one.
+var _ crdt.SQLLog = (*CrashLog)(nil)
+```
+
+and add `"github.com/dhiazfathra/local-first-architecture/eventlog-lab/crdt"` to the imports.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cd eventlog-lab && go test ./internal/jepsenlite/ -v`
+Expected: PASS, all cases.
+
+- [ ] **Step 6: Run the full gate**
+
+```bash
+cd eventlog-lab
+go test ./... -cover
+golangci-lint run
+```
+Expected: every package still 100.0%; `internal/jepsenlite` reports its own coverage — per the Global Constraints the harness counts as tests, so it is reported but not gated at 100%. Every other package remains gated.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd eventlog-lab
+git add internal/jepsenlite/
+git commit -m "feat(jepsenlite): seven independently togglable fault injectors"
+```
+
+---
+
+### Task 12: `internal/jepsenlite/` — seeded op and fault schedules
+
+Everything a run does is decided up front from the seed, so a schedule can be
+printed, diffed, and replayed. Split from Task 13 so the generator is reviewable
+without the simulator.
+
+**Files:**
+- Create: `eventlog-lab/internal/jepsenlite/schedule.go`
+- Test: `eventlog-lab/internal/jepsenlite/schedule_test.go`
+
+**Interfaces:**
+- Consumes: `clock.NodeID` (Task 1); `Faults` (Task 11).
+- Produces:
+  - `type OpKind int` with `OpReceive OpKind = iota; OpPick; OpSetMeta; OpDelete`
+  - `func (k OpKind) String() string`
+  - `type Op struct { Node clock.NodeID; Kind OpKind; SKU string; Qty int64; Name string; ReorderPoint int64; Deleted bool }`
+  - `type FaultEvent struct { At int; Kind string; A, B clock.NodeID }` — `Kind` is one of `"partition"`, `"asym"`, `"heal"`, `"crash"`.
+  - `type Schedule struct { Seed int64; Nodes []clock.NodeID; SKUs []string; Ops []Op; Faults []FaultEvent; Slow clock.NodeID; Skews map[clock.NodeID]int64; Jumps map[clock.NodeID]int; SyncEvery int }`
+  - `func GenSchedule(seed int64, nodes, ops int, f Faults) Schedule`
+
+**Domain notes for the implementer:**
+- `GenSchedule` is a pure function of `(seed, nodes, ops, faults)`. Same inputs, byte-identical schedule, forever. That is the whole reason a failure can print a seed instead of a 500-line trace.
+- Node IDs are `"N0"`, `"N1"`, … and SKUs are `"SKU-0"` … `"SKU-{k}"` where `k = max(1, nodes)`. Deliberately few SKUs: contention is what finds bugs, and a thousand SKUs touched once each finds nothing.
+- `Skews` and `Jumps` are only populated when `Faults.ClockSkew` is set; `Slow` is only set when `Faults.SlowPeer` is set. A caller must be able to tell "no skew configured" from "skew of zero".
+- Skews deliberately include negative offsets and backwards jumps: a node whose clock runs *behind* is the one that loses every LWW conflict unless `Observe` is wired correctly.
+- `Faults` events are emitted in nondecreasing `At` order so the simulator can walk them with a single index. A `partition` or `asym` is always followed by a matching `heal` later in the schedule — an unhealed partition at the end of the op phase is fine (the simulator heals before quiescence), but a schedule that never heals tests nothing about recovery.
+
+- [ ] **Step 1: Write the failing tests**
+
+`eventlog-lab/internal/jepsenlite/schedule_test.go`:
+
+```go
+package jepsenlite
+
+import (
+	"reflect"
+	"testing"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+)
+
+func TestGenScheduleIsDeterministic(t *testing.T) {
+	f := Faults{Partition: true, ClockSkew: true, Duplicate: true, SlowPeer: true}
+	a := GenSchedule(42, 3, 60, f)
+	b := GenSchedule(42, 3, 60, f)
+	if !reflect.DeepEqual(a, b) {
+		t.Fatalf("GenSchedule is not deterministic for the same seed")
+	}
+	c := GenSchedule(43, 3, 60, f)
+	if reflect.DeepEqual(a, c) {
+		t.Fatalf("GenSchedule(42) == GenSchedule(43); the seed is not being used")
+	}
+}
+
+func TestGenScheduleShape(t *testing.T) {
+	tests := []struct {
+		name      string
+		nodes     int
+		ops       int
+		faults    Faults
+		wantNodes int
+		wantOps   int
+		wantSkew  bool
+		wantSlow  bool
+		wantFault bool
+	}{
+		{
+			name: "no faults yields ops only",
+			nodes: 3, ops: 30, faults: Faults{},
+			wantNodes: 3, wantOps: 30,
+		},
+		{
+			name: "skew populates offsets per node",
+			nodes: 3, ops: 30, faults: Faults{ClockSkew: true},
+			wantNodes: 3, wantOps: 30, wantSkew: true,
+		},
+		{
+			name: "slow peer names one node",
+			nodes: 3, ops: 30, faults: Faults{SlowPeer: true},
+			wantNodes: 3, wantOps: 30, wantSlow: true,
+		},
+		{
+			name: "partition emits fault events",
+			nodes: 3, ops: 40, faults: Faults{Partition: true},
+			wantNodes: 3, wantOps: 40, wantFault: true,
+		},
+		{
+			name: "asymmetric partition emits fault events",
+			nodes: 3, ops: 40, faults: Faults{AsymPartition: true},
+			wantNodes: 3, wantOps: 40, wantFault: true,
+		},
+		{
+			name: "crash emits fault events",
+			nodes: 2, ops: 40, faults: Faults{CrashMidAppend: true},
+			wantNodes: 2, wantOps: 40, wantFault: true,
+		},
+		{
+			name: "single node clamps to one and needs no pair faults",
+			nodes: 1, ops: 5, faults: Faults{Partition: true},
+			wantNodes: 1, wantOps: 5,
+		},
+		{
+			name: "zero nodes clamps to one",
+			nodes: 0, ops: 5, faults: Faults{},
+			wantNodes: 1, wantOps: 5,
+		},
+		{
+			name: "zero ops is legal",
+			nodes: 2, ops: 0, faults: Faults{},
+			wantNodes: 2, wantOps: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := GenSchedule(7, tt.nodes, tt.ops, tt.faults)
+			if len(s.Nodes) != tt.wantNodes {
+				t.Errorf("len(Nodes) = %d, want %d", len(s.Nodes), tt.wantNodes)
+			}
+			if len(s.Ops) != tt.wantOps {
+				t.Errorf("len(Ops) = %d, want %d", len(s.Ops), tt.wantOps)
+			}
+			if got := len(s.Skews) > 0; got != tt.wantSkew {
+				t.Errorf("Skews populated = %v, want %v", got, tt.wantSkew)
+			}
+			if got := s.Slow != ""; got != tt.wantSlow {
+				t.Errorf("Slow set = %v (%q), want %v", got, s.Slow, tt.wantSlow)
+			}
+			if got := len(s.Faults) > 0; got != tt.wantFault {
+				t.Errorf("Faults emitted = %v, want %v", got, tt.wantFault)
+			}
+			if s.SyncEvery < 1 {
+				t.Errorf("SyncEvery = %d, want >= 1", s.SyncEvery)
+			}
+			if len(s.SKUs) < 2 {
+				t.Errorf("len(SKUs) = %d, want >= 2 (contention needs sharing)", len(s.SKUs))
+			}
+		})
+	}
+}
+
+func TestGenScheduleOpsAreWellFormed(t *testing.T) {
+	s := GenSchedule(11, 3, 200, Faults{})
+	nodes := map[clock.NodeID]bool{}
+	for _, id := range s.Nodes {
+		nodes[id] = true
+	}
+	skus := map[string]bool{}
+	for _, sku := range s.SKUs {
+		skus[sku] = true
+	}
+	kinds := map[OpKind]int{}
+	for i, op := range s.Ops {
+		if !nodes[op.Node] {
+			t.Fatalf("op %d node %q not in Nodes", i, op.Node)
+		}
+		if !skus[op.SKU] {
+			t.Fatalf("op %d sku %q not in SKUs", i, op.SKU)
+		}
+		if (op.Kind == OpReceive || op.Kind == OpPick) && op.Qty <= 0 {
+			t.Fatalf("op %d kind %v qty = %d, want > 0 (node rejects non-positive)",
+				i, op.Kind, op.Qty)
+		}
+		kinds[op.Kind]++
+	}
+	for _, k := range []OpKind{OpReceive, OpPick, OpSetMeta, OpDelete} {
+		if kinds[k] == 0 {
+			t.Errorf("kind %v never generated in 200 ops", k)
+		}
+	}
+}
+
+func TestGenScheduleFaultEventsAreOrderedAndHealed(t *testing.T) {
+	s := GenSchedule(13, 3, 120, Faults{Partition: true, AsymPartition: true, CrashMidAppend: true})
+	last := -1
+	opens := 0
+	for i, fe := range s.Faults {
+		if fe.At < last {
+			t.Fatalf("fault %d At = %d, out of order after %d", i, fe.At, last)
+		}
+		last = fe.At
+		if fe.At < 0 || fe.At >= len(s.Ops) {
+			t.Fatalf("fault %d At = %d out of range [0,%d)", i, fe.At, len(s.Ops))
+		}
+		switch fe.Kind {
+		case "partition", "asym":
+			if fe.A == fe.B {
+				t.Fatalf("fault %d partitions node %q from itself", i, fe.A)
+			}
+			opens++
+		case "heal":
+			opens--
+		case "crash":
+			if fe.A == "" {
+				t.Fatalf("fault %d crash has no node", i)
+			}
+		default:
+			t.Fatalf("fault %d unknown kind %q", i, fe.Kind)
+		}
+	}
+	if opens < 0 {
+		t.Fatalf("more heals than partitions")
+	}
+	if opens == len(s.Faults) {
+		t.Fatalf("no heal emitted; recovery is never exercised")
+	}
+}
+
+func TestGenScheduleSkewsIncludeNegativeAndBackwardsJumps(t *testing.T) {
+	s := GenSchedule(17, 4, 40, Faults{ClockSkew: true})
+	sawNegative, sawJump := false, false
+	for _, id := range s.Nodes {
+		if s.Skews[id] < 0 {
+			sawNegative = true
+		}
+		if s.Jumps[id] > 0 {
+			sawJump = true
+		}
+	}
+	if !sawNegative {
+		t.Errorf("no node given a negative skew; the losing-clock case is untested")
+	}
+	if !sawJump {
+		t.Errorf("no node given a backwards jump; HLC clamping is untested")
+	}
+}
+
+func TestOpKindString(t *testing.T) {
+	tests := []struct {
+		k    OpKind
+		want string
+	}{
+		{OpReceive, "receive"},
+		{OpPick, "pick"},
+		{OpSetMeta, "setmeta"},
+		{OpDelete, "delete"},
+		{OpKind(99), "OpKind(99)"},
+	}
+	for _, tt := range tests {
+		if got := tt.k.String(); got != tt.want {
+			t.Errorf("OpKind(%d).String() = %q, want %q", int(tt.k), got, tt.want)
+		}
+	}
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd eventlog-lab && go test ./internal/jepsenlite/ -run Schedule -v`
+Expected: FAIL to build — `undefined: GenSchedule`, `undefined: OpReceive`, `undefined: OpKind`.
+
+- [ ] **Step 3: Write the implementation**
+
+`eventlog-lab/internal/jepsenlite/schedule.go`:
+
+```go
+package jepsenlite
+
+import (
+	"fmt"
+	"math/rand"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+)
+
+// OpKind is one of the four in-process node operations the simulator drives.
+type OpKind int
+
+// The four op kinds. These mirror node.Node's op API exactly.
+const (
+	OpReceive OpKind = iota
+	OpPick
+	OpSetMeta
+	OpDelete
+)
+
+// String names the op kind for reports.
+func (k OpKind) String() string {
+	switch k {
+	case OpReceive:
+		return "receive"
+	case OpPick:
+		return "pick"
+	case OpSetMeta:
+		return "setmeta"
+	case OpDelete:
+		return "delete"
+	default:
+		return fmt.Sprintf("OpKind(%d)", int(k))
+	}
+}
+
+// Op is a single scheduled operation against one node.
+type Op struct {
+	Node         clock.NodeID
+	Kind         OpKind
+	SKU          string
+	Qty          int64 // OpReceive, OpPick: always > 0
+	Name         string
+	ReorderPoint int64
+	Deleted      bool
+}
+
+// FaultEvent schedules a fault to fire immediately before op index At.
+// Kind is "partition", "asym", "heal", or "crash"; A and B name the nodes
+// involved ("crash" and "heal" use A only, "heal" uses neither).
+type FaultEvent struct {
+	At   int
+	Kind string
+	A, B clock.NodeID
+}
+
+// Schedule is the complete, replayable description of one simulator run.
+// GenSchedule is a pure function of its arguments, so a seed is a full
+// reproduction recipe.
+type Schedule struct {
+	Seed      int64
+	Nodes     []clock.NodeID
+	SKUs      []string
+	Ops       []Op
+	Faults    []FaultEvent
+	Slow      clock.NodeID          // "" unless Faults.SlowPeer
+	Skews     map[clock.NodeID]int64 // empty unless Faults.ClockSkew
+	Jumps     map[clock.NodeID]int   // backwards jump period, 0 = never
+	SyncEvery int                    // run a full sync round every N ops
+}
+
+// GenSchedule builds a deterministic schedule. Same (seed, nodes, ops, faults)
+// always yields a byte-identical Schedule.
+func GenSchedule(seed int64, nodes, ops int, f Faults) Schedule {
+	if nodes < 1 {
+		nodes = 1
+	}
+	if ops < 0 {
+		ops = 0
+	}
+	rng := rand.New(rand.NewSource(seed))
+
+	s := Schedule{
+		Seed:      seed,
+		Skews:     map[clock.NodeID]int64{},
+		Jumps:     map[clock.NodeID]int{},
+		SyncEvery: 5,
+	}
+	for i := 0; i < nodes; i++ {
+		s.Nodes = append(s.Nodes, clock.NodeID(fmt.Sprintf("N%d", i)))
+	}
+	// Few SKUs on purpose: contention finds bugs, breadth does not.
+	for i := 0; i <= max(1, nodes); i++ {
+		s.SKUs = append(s.SKUs, fmt.Sprintf("SKU-%d", i))
+	}
+
+	names := []string{"widget", "gasket", "flange", "bolt"}
+	for i := 0; i < ops; i++ {
+		op := Op{
+			Node: s.Nodes[rng.Intn(len(s.Nodes))],
+			SKU:  s.SKUs[rng.Intn(len(s.SKUs))],
+		}
+		switch rng.Intn(10) {
+		case 0, 1, 2, 3:
+			op.Kind, op.Qty = OpReceive, int64(1+rng.Intn(20))
+		case 4, 5, 6, 7:
+			op.Kind, op.Qty = OpPick, int64(1+rng.Intn(20))
+		case 8:
+			op.Kind = OpSetMeta
+			op.Name = names[rng.Intn(len(names))]
+			op.ReorderPoint = int64(rng.Intn(50))
+		default:
+			op.Kind = OpDelete
+			op.Deleted = rng.Intn(2) == 0
+		}
+		s.Ops = append(s.Ops, op)
+	}
+
+	if f.ClockSkew {
+		for i, id := range s.Nodes {
+			// Alternate ahead and behind: a clock running behind is the one
+			// that loses every LWW conflict unless Observe is wired right.
+			mag := int64(1+rng.Intn(60)) * 1000
+			if i%2 == 1 {
+				mag = -mag
+			}
+			s.Skews[id] = mag
+			if rng.Intn(2) == 0 {
+				s.Jumps[id] = 3 + rng.Intn(5)
+			}
+		}
+		// Guarantee both interesting cases exist regardless of the draw.
+		s.Skews[s.Nodes[0]] = -30000
+		s.Jumps[s.Nodes[0]] = 4
+	}
+	if f.SlowPeer {
+		s.Slow = s.Nodes[rng.Intn(len(s.Nodes))]
+	}
+	s.Faults = genFaultEvents(rng, s.Nodes, ops, f)
+	return s
+}
+
+// genFaultEvents emits fault events in nondecreasing At order. Every partition
+// gets a matching heal so recovery is exercised.
+func genFaultEvents(rng *rand.Rand, ids []clock.NodeID, ops int, f Faults) []FaultEvent {
+	if ops == 0 {
+		return nil
+	}
+	var out []FaultEvent
+	pairFaults := (f.Partition || f.AsymPartition) && len(ids) > 1
+
+	// Windows of length ops/8, at most four of them.
+	window := max(1, ops/8)
+	for start := window; start+window < ops && len(out) < 12; start += 3 * window {
+		if pairFaults {
+			a, b := pickPair(rng, ids)
+			kind := "partition"
+			if f.AsymPartition && (!f.Partition || rng.Intn(2) == 0) {
+				kind = "asym"
+			}
+			out = append(out,
+				FaultEvent{At: start, Kind: kind, A: a, B: b},
+				FaultEvent{At: start + window, Kind: "heal"},
+			)
+		}
+		if f.CrashMidAppend {
+			out = append(out, FaultEvent{
+				At:   start + window,
+				Kind: "crash",
+				A:    ids[rng.Intn(len(ids))],
+			})
+		}
+	}
+	sortFaults(out)
+	return out
+}
+
+// pickPair returns two distinct node IDs.
+func pickPair(rng *rand.Rand, ids []clock.NodeID) (clock.NodeID, clock.NodeID) {
+	i := rng.Intn(len(ids))
+	j := rng.Intn(len(ids) - 1)
+	if j >= i {
+		j++
+	}
+	return ids[i], ids[j]
+}
+
+// sortFaults stable-sorts by At using insertion sort -- the slice is tiny and
+// this keeps the generator free of any nondeterministic comparator.
+func sortFaults(fs []FaultEvent) {
+	for i := 1; i < len(fs); i++ {
+		for j := i; j > 0 && fs[j].At < fs[j-1].At; j-- {
+			fs[j], fs[j-1] = fs[j-1], fs[j]
+		}
+	}
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cd eventlog-lab && go test ./internal/jepsenlite/ -run 'Schedule|OpKind' -v`
+Expected: PASS, all cases.
+
+- [ ] **Step 5: Run the full gate**
+
+```bash
+cd eventlog-lab
+go test ./... -cover
+golangci-lint run
+```
+Expected: all non-harness packages 100.0%, lint clean.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd eventlog-lab
+git add internal/jepsenlite/
+git commit -m "feat(jepsenlite): seeded op and fault schedule generation"
+```
+
+---
+
+### Task 13: `internal/jepsenlite/` — the simulator and the three properties
+
+The payoff task. Builds a cluster on the in-memory transport, runs a schedule to
+quiescence with faults firing, then asserts convergence, no-lost-event, and
+order independence — and prints a reproducing seed on failure.
+
+**Files:**
+- Create: `eventlog-lab/internal/jepsenlite/harness.go`
+- Test: `eventlog-lab/internal/jepsenlite/harness_test.go`
+
+**Interfaces:**
+- Consumes: `Faults`, `Injector`, `NewInjector`, `Stats`, `CrashLog`, `OpenCrashLog`, `ErrCrash`, `NewWall` (Task 11); `Schedule`, `GenSchedule`, `Op`, `OpKind` constants, `FaultEvent` (Task 12); `clock.NodeID`; `eventlog.Event`, `eventlog.EventID`, `eventlog.VersionVector`; `crdt.ItemState`, `crdt.NewItemState`, `crdt.Projector`, `crdt.SQLLog`, `(*ItemState).Apply`, `(*ItemState).Equal`, `(*ItemState).Quantity`; `node.New`, `node.Config`, `*node.Node`; `sync.NewServer`, `sync.NewClient`, `sync.MemoryTransport`, `sync.NewMemoryTransport`, `(*MemoryTransport).Serve`, `(*MemoryTransport).SetFilter`, `sync.Report`.
+- Produces:
+  - `type Cluster struct { Nodes map[clock.NodeID]*node.Node; Logs map[clock.NodeID]*CrashLog; IDs []clock.NodeID; Inj *Injector; … }`
+  - `func NewCluster(dir string, sch Schedule, f Faults) (*Cluster, error)`
+  - `func (c *Cluster) Close() error`
+  - `func (c *Cluster) ApplyOp(ctx context.Context, op Op) (eventlog.EventID, error)`
+  - `func (c *Cluster) SyncPair(ctx context.Context, from, to clock.NodeID) error`
+  - `func (c *Cluster) SyncRound(ctx context.Context) int`
+  - `func (c *Cluster) Quiesce(ctx context.Context, maxRounds int) error`
+  - `func (c *Cluster) Project(ctx context.Context, id clock.NodeID, sku string) (*crdt.ItemState, error)`
+  - `func (c *Cluster) Snapshot(ctx context.Context, id clock.NodeID, sku string) error`
+  - `func (c *Cluster) AckedFloor(ctx context.Context, id clock.NodeID) (eventlog.VersionVector, error)`
+  - `func (c *Cluster) CheckConvergence(ctx context.Context, skus []string) error`
+  - `func (c *Cluster) CheckNoLostEvent(ctx context.Context, acked []eventlog.EventID) error`
+  - `func (c *Cluster) CheckOrderIndependence(ctx context.Context, rng *rand.Rand, skus []string) error`
+  - `type Result struct { Seed int64; Faults []string; Ops, Acked, Failed, Rounds, Crashes int; Stats Stats; Quantities map[string]int64; Anomalies []string }`
+  - `func (r Result) String() string`
+  - `func Run(ctx context.Context, dir string, sch Schedule, f Faults) (Result, error)`
+
+**Domain notes for the implementer:**
+
+- **The three properties, restated as code:**
+  1. *Convergence* — for every SKU, `Project(id, sku)` is `Equal` across every node. Compared via `crdt.ItemState.Equal`, not by quantity alone: two states can agree on quantity and disagree on `Name` or `Deleted`.
+  2. *No lost event* — for every `EventID` an op returned with a nil error, every node's `VersionVector` `Contains` it. Ops that returned an error (including `ErrCrash`) are **not** acked and are deliberately excluded — the spec's error handling says an unacknowledged op carries no guarantee.
+  3. *Order independence* — for every node and SKU, gather that node's events for the SKU, shuffle them into a random permutation, `fold(Apply, …)` from a fresh `crdt.NewItemState()`, and require `Equal` to the node's own projection.
+- **Quiescence means: heal every partition, then sync full mesh until nothing changes.** `Quiesce` loops sync rounds until every node's `VersionVector` is identical, or `maxRounds` is exhausted — in which case it returns an error, because a harness that silently gives up reports false convergence. Partitions must be healed first or the loop can never terminate.
+- **Slow peer** is realised here: `SyncRound` orders sessions so the slow node's sessions run last, which puts its acknowledgement after every other node's next batch.
+- **Sessions are expected to fail during a partition.** `SyncRound` counts successes and swallows session errors — a partition *should* break the stream. The retry is the next round, exactly as `SyncWithBackoff` would do in production. Only a failure that survives quiescence is a real failure.
+- **Every failure message must carry the seed.** `Run` wraps each property error as
+  `fmt.Errorf("seed %d: %w", sch.Seed, err)`. That single line is what turns a red CI run into a one-command local reproduction.
+- **Compaction is checked separately** (Step 5's stale-peer test) because order independence cannot hold against a compacted log by construction: compaction deletes events on purpose, so folding from scratch is no longer possible. The read path then relies on the snapshot, and the property that must still hold is convergence.
+
+- [ ] **Step 1: Write the failing simulator tests**
+
+`eventlog-lab/internal/jepsenlite/harness_test.go`:
+
+```go
+package jepsenlite
+
+import (
+	"context"
+	"math/rand"
+	"strings"
+	"testing"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/eventlog"
+)
+
+func TestRunHoldsAllThreePropertiesUnderEveryFaultCombination(t *testing.T) {
+	tests := []struct {
+		name   string
+		faults Faults
+	}{
+		{name: "no faults", faults: Faults{}},
+		{name: "partition", faults: Faults{Partition: true}},
+		{name: "asymmetric partition", faults: Faults{AsymPartition: true}},
+		{name: "clock skew", faults: Faults{ClockSkew: true}},
+		{name: "duplicate delivery", faults: Faults{Duplicate: true}},
+		{name: "reorder", faults: Faults{Reorder: true}},
+		{name: "crash mid-append", faults: Faults{CrashMidAppend: true}},
+		{name: "slow peer", faults: Faults{SlowPeer: true}},
+		{
+			name:   "spec CLI example: partition, skew, dup",
+			faults: Faults{Partition: true, ClockSkew: true, Duplicate: true},
+		},
+		{
+			name: "all seven composed",
+			faults: Faults{
+				Partition: true, AsymPartition: true, ClockSkew: true,
+				Duplicate: true, Reorder: true, CrashMidAppend: true, SlowPeer: true,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, seed := range []int64{1, 2, 3} {
+				sch := GenSchedule(seed, 3, 120, tt.faults)
+				res, err := Run(context.Background(), t.TempDir(), sch, tt.faults)
+				if err != nil {
+					t.Fatalf("Run(seed=%d) error = %v\nreproduce with: go run ./cmd/lab sim --seed %d --nodes 3 --ops 120 --faults %s",
+						seed, err, seed, strings.Join(tt.faults.Names(), ","))
+				}
+				if res.Seed != seed {
+					t.Errorf("Result.Seed = %d, want %d", res.Seed, seed)
+				}
+				if res.Acked+res.Failed != res.Ops {
+					t.Errorf("Acked+Failed = %d, want Ops = %d",
+						res.Acked+res.Failed, res.Ops)
+				}
+				if res.Acked == 0 {
+					t.Errorf("no op was acknowledged; the run tested nothing")
+				}
+			}
+		})
+	}
+}
+
+func TestCheckConvergenceDetectsDivergenceAndNamesTheSKU(t *testing.T) {
+	// Convergence is checked against a deliberately corrupted node: inject an
+	// event into one node's log only, after quiescence, and check by hand.
+	ctx := context.Background()
+	sch := GenSchedule(99, 2, 10, Faults{})
+	c, err := NewCluster(t.TempDir(), sch, Faults{})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 5}); err != nil {
+		t.Fatalf("ApplyOp() error = %v", err)
+	}
+	if err := c.Quiesce(ctx, 8); err != nil {
+		t.Fatalf("Quiesce() error = %v", err)
+	}
+	// Now diverge N0 only.
+	rogue := eventlog.Event{
+		ID:    eventlog.EventID{NodeID: "ROGUE", Seq: 1},
+		HLC:   clock.HLC{Wall: 1 << 40, NodeID: "ROGUE"},
+		SKU:   "SKU-0",
+		Kind:  eventlog.KindQuantityDelta,
+		Delta: 1000,
+	}
+	if err := c.Logs["N0"].Append(ctx, rogue); err != nil {
+		t.Fatalf("Append(rogue) error = %v", err)
+	}
+	err = c.CheckConvergence(ctx, []string{"SKU-0"})
+	if err == nil {
+		t.Fatalf("CheckConvergence() = nil, want divergence error")
+	}
+	if !strings.Contains(err.Error(), "SKU-0") {
+		t.Errorf("CheckConvergence() error = %q, want it to name the SKU", err)
+	}
+}
+
+func TestCheckNoLostEventDetectsAMissingEvent(t *testing.T) {
+	ctx := context.Background()
+	sch := GenSchedule(5, 2, 4, Faults{})
+	c, err := NewCluster(t.TempDir(), sch, Faults{})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	id, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 3})
+	if err != nil {
+		t.Fatalf("ApplyOp() error = %v", err)
+	}
+	// Before syncing, N1 does not hold it: the property must fail.
+	if err := c.CheckNoLostEvent(ctx, []eventlog.EventID{id}); err == nil {
+		t.Fatalf("CheckNoLostEvent() before sync = nil, want error")
+	}
+	if err := c.Quiesce(ctx, 8); err != nil {
+		t.Fatalf("Quiesce() error = %v", err)
+	}
+	if err := c.CheckNoLostEvent(ctx, []eventlog.EventID{id}); err != nil {
+		t.Fatalf("CheckNoLostEvent() after quiescence = %v, want nil", err)
+	}
+}
+
+func TestCheckOrderIndependenceOnAContendedSKU(t *testing.T) {
+	ctx := context.Background()
+	sch := GenSchedule(21, 3, 60, Faults{})
+	cl, err := NewCluster(t.TempDir(), sch, Faults{})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+
+	for _, op := range sch.Ops {
+		if _, err := cl.ApplyOp(ctx, op); err != nil {
+			t.Fatalf("ApplyOp(%+v) error = %v", op, err)
+		}
+	}
+	if err := cl.Quiesce(ctx, 16); err != nil {
+		t.Fatalf("Quiesce() error = %v", err)
+	}
+	if err := cl.CheckOrderIndependence(ctx, rand.New(rand.NewSource(21)), sch.SKUs); err != nil {
+		t.Fatalf("CheckOrderIndependence() error = %v", err)
+	}
+}
+
+func TestQuiesceReportsFailureRatherThanGivingUpSilently(t *testing.T) {
+	ctx := context.Background()
+	sch := GenSchedule(31, 2, 4, Faults{})
+	c, err := NewCluster(t.TempDir(), sch, Faults{})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 1}); err != nil {
+		t.Fatalf("ApplyOp() error = %v", err)
+	}
+	if err := c.Quiesce(ctx, 0); err == nil {
+		t.Fatalf("Quiesce(maxRounds=0) = nil, want error")
+	}
+}
+
+func TestResultString(t *testing.T) {
+	r := Result{
+		Seed:   42,
+		Faults: []string{"dup", "partition"},
+		Ops:    10, Acked: 9, Failed: 1, Rounds: 3, Crashes: 1,
+		Stats:      Stats{Dropped: 4, Duplicated: 2, Reordered: 1},
+		Quantities: map[string]int64{"SKU-0": -6},
+		Anomalies:  []string{"SKU-0 quantity -6"},
+	}
+	s := r.String()
+	for _, want := range []string{"seed 42", "partition", "acked 9", "SKU-0", "-6"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("Result.String() = %q, missing %q", s, want)
+		}
+	}
+}
+
+func TestApplyOpRejectsAnUnknownOpKind(t *testing.T) {
+	ctx := context.Background()
+	sch := GenSchedule(41, 1, 1, Faults{})
+	c, err := NewCluster(t.TempDir(), sch, Faults{})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpKind(99), SKU: "SKU-0"}); err == nil {
+		t.Fatalf("ApplyOp(unknown kind) = nil, want error")
+	}
+}
+
+func TestApplyOpRejectsAnUnknownNode(t *testing.T) {
+	ctx := context.Background()
+	sch := GenSchedule(43, 1, 1, Faults{})
+	c, err := NewCluster(t.TempDir(), sch, Faults{})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.ApplyOp(ctx, Op{Node: "nope", Kind: OpReceive, SKU: "SKU-0", Qty: 1}); err == nil {
+		t.Fatalf("ApplyOp(unknown node) = nil, want error")
+	}
+}
+
+func TestConvergenceSurvivesAggressiveCompactionAgainstAStalePeer(t *testing.T) {
+	// The spec's compaction property: compact aggressively on one node, then
+	// let a peer that has seen nothing sync, and require convergence.
+	ctx := context.Background()
+	sch := GenSchedule(77, 3, 0, Faults{})
+	c, err := NewCluster(t.TempDir(), sch, Faults{})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// N0 and N1 do work and sync with each other. N2 stays stale.
+	for i := 0; i < 12; i++ {
+		if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 2}); err != nil {
+			t.Fatalf("ApplyOp() error = %v", err)
+		}
+		if _, err := c.ApplyOp(ctx, Op{Node: "N1", Kind: OpPick, SKU: "SKU-0", Qty: 1}); err != nil {
+			t.Fatalf("ApplyOp() error = %v", err)
+		}
+	}
+	if err := c.SyncPair(ctx, "N0", "N1"); err != nil {
+		t.Fatalf("SyncPair(N0,N1) error = %v", err)
+	}
+
+	// Force a snapshot on N0 covering everything it holds, then compact using
+	// only what N1 has acked -- N2 has acked nothing, so nothing N2 lacks may
+	// be deleted.
+	if err := c.Snapshot(ctx, "N0", "SKU-0"); err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	acked, err := c.AckedFloor(ctx, "N0")
+	if err != nil {
+		t.Fatalf("AckedFloor() error = %v", err)
+	}
+	if err := c.Logs["N0"].Compact(ctx, acked); err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	// Now the stale peer syncs and everyone must still converge.
+	if err := c.Quiesce(ctx, 16); err != nil {
+		t.Fatalf("Quiesce() error = %v", err)
+	}
+	if err := c.CheckConvergence(ctx, []string{"SKU-0"}); err != nil {
+		t.Fatalf("CheckConvergence() after aggressive compaction = %v", err)
+	}
+	st, err := c.Project(ctx, "N2", "SKU-0")
+	if err != nil {
+		t.Fatalf("Project(N2) error = %v", err)
+	}
+	if got := st.Quantity(); got != 12 {
+		t.Errorf("stale peer quantity = %d, want 12 (12*+2 and 12*-1)", got)
+	}
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd eventlog-lab && go test ./internal/jepsenlite/ -run 'Run|Check|Quiesce|Result|ApplyOp|Compaction' -v`
+Expected: FAIL to build — `undefined: NewCluster`, `undefined: Run`, `undefined: Result`.
+
+- [ ] **Step 3: Write the cluster**
+
+`eventlog-lab/internal/jepsenlite/harness.go`:
+
+```go
+package jepsenlite
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/crdt"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/eventlog"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/node"
+	syncpkg "github.com/dhiazfathra/local-first-architecture/eventlog-lab/sync"
+)
+
+// snapshotEvery is how many events per SKU trigger a snapshot in simulated
+// nodes. Deliberately small so the snapshot read path is exercised constantly.
+const snapshotEvery = 4
+
+// syncBatchSize keeps batches small so reorder and duplicate faults have
+// several frames per session to act on.
+const syncBatchSize = 3
+
+// Cluster is a set of in-process nodes wired to the in-memory transport with
+// the fault injector installed. Addresses on the transport are node IDs.
+type Cluster struct {
+	IDs     []clock.NodeID
+	Nodes   map[clock.NodeID]*node.Node
+	Logs    map[clock.NodeID]*CrashLog
+	Servers map[clock.NodeID]*syncpkg.Server
+	Trans   *syncpkg.MemoryTransport
+	Inj     *Injector
+	slow    clock.NodeID
+}
+
+// NewCluster builds a cluster under dir following sch's node list, clock skews,
+// and slow-peer choice.
+func NewCluster(dir string, sch Schedule, f Faults) (*Cluster, error) {
+	c := &Cluster{
+		Nodes:   map[clock.NodeID]*node.Node{},
+		Logs:    map[clock.NodeID]*CrashLog{},
+		Servers: map[clock.NodeID]*syncpkg.Server{},
+		Trans:   syncpkg.NewMemoryTransport(),
+		Inj:     NewInjector(rand.New(rand.NewSource(sch.Seed)), f),
+		slow:    sch.Slow,
+	}
+	c.Trans.SetFilter(c.Inj.Filter)
+
+	for _, id := range sch.Nodes {
+		// A file-backed DB, because the crash fault reopens it.
+		l, err := OpenCrashLog(filepath.Join(dir, string(id)+".db"))
+		if err != nil {
+			return nil, err
+		}
+		n, err := node.New(node.Config{
+			ID:            id,
+			Log:           l,
+			Wall:          NewWall(1_700_000_000_000, sch.Skews[id], sch.Jumps[id], 25),
+			SnapshotEvery: snapshotEvery,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("build node %q: %w", id, err)
+		}
+		srv := syncpkg.NewServer(n, syncBatchSize)
+		c.Trans.Serve(string(id), srv)
+
+		c.IDs = append(c.IDs, id)
+		c.Nodes[id] = n
+		c.Logs[id] = l
+		c.Servers[id] = srv
+	}
+	return c, nil
+}
+
+// Close closes every log, returning the first error.
+func (c *Cluster) Close() error {
+	var first error
+	for _, id := range c.IDs {
+		if err := c.Logs[id].Close(); err != nil && first == nil {
+			first = fmt.Errorf("close %q: %w", id, err)
+		}
+	}
+	return first
+}
+
+// ApplyOp drives one scheduled op against its node. A returned error means the
+// op was not acknowledged, so the no-lost-event property does not cover it.
+func (c *Cluster) ApplyOp(ctx context.Context, op Op) (eventlog.EventID, error) {
+	n, ok := c.Nodes[op.Node]
+	if !ok {
+		return eventlog.EventID{}, fmt.Errorf("unknown node %q", op.Node)
+	}
+	switch op.Kind {
+	case OpReceive:
+		return n.Receive(ctx, op.SKU, op.Qty)
+	case OpPick:
+		return n.Pick(ctx, op.SKU, op.Qty)
+	case OpSetMeta:
+		name, rp := op.Name, op.ReorderPoint
+		return n.SetMeta(ctx, op.SKU, &name, &rp)
+	case OpDelete:
+		return n.Delete(ctx, op.SKU, op.Deleted)
+	default:
+		return eventlog.EventID{}, fmt.Errorf("unknown op kind %v", op.Kind)
+	}
+}
+
+// SyncPair runs one client session from a to b. A session failing during a
+// partition is expected, so the error is returned for the caller to ignore.
+func (c *Cluster) SyncPair(ctx context.Context, from, to clock.NodeID) error {
+	cl := syncpkg.NewClient(c.Nodes[from], c.Trans, syncBatchSize)
+	if _, err := cl.SyncOnce(ctx, string(to)); err != nil {
+		return fmt.Errorf("sync %q -> %q: %w", from, to, err)
+	}
+	return nil
+}
+
+// SyncRound runs a full mesh of sessions and returns how many succeeded. The
+// slow peer's sessions run last: that is the "slow peer" fault, realised as
+// scheduling rather than as a withheld ack (withholding an ack the peer is
+// synchronously waiting for deadlocks instead of delaying).
+func (c *Cluster) SyncRound(ctx context.Context) int {
+	ok := 0
+	for _, from := range c.syncOrder() {
+		for _, to := range c.IDs {
+			if from == to {
+				continue
+			}
+			if err := c.SyncPair(ctx, from, to); err == nil {
+				ok++
+			}
+		}
+	}
+	return ok
+}
+
+// syncOrder returns node IDs with the slow peer moved to the end.
+func (c *Cluster) syncOrder() []clock.NodeID {
+	if c.slow == "" {
+		return c.IDs
+	}
+	out := make([]clock.NodeID, 0, len(c.IDs))
+	for _, id := range c.IDs {
+		if id != c.slow {
+			out = append(out, id)
+		}
+	}
+	return append(out, c.slow)
+}
+
+// Quiesce heals every partition and syncs full mesh until all nodes hold the
+// same version vector. It returns an error rather than giving up silently: a
+// harness that quietly stops syncing reports false convergence.
+func (c *Cluster) Quiesce(ctx context.Context, maxRounds int) error {
+	c.Inj.Heal()
+	for round := 0; round < maxRounds; round++ {
+		c.SyncRound(ctx)
+		same, err := c.vectorsAgree(ctx)
+		if err != nil {
+			return err
+		}
+		if same {
+			return nil
+		}
+	}
+	return fmt.Errorf("no quiescence after %d rounds", maxRounds)
+}
+
+// vectorsAgree reports whether every node holds the same version vector.
+func (c *Cluster) vectorsAgree(ctx context.Context) (bool, error) {
+	var first eventlog.VersionVector
+	for i, id := range c.IDs {
+		vv, err := c.Nodes[id].VersionVector(ctx)
+		if err != nil {
+			return false, fmt.Errorf("version vector of %q: %w", id, err)
+		}
+		if i == 0 {
+			first = vv
+			continue
+		}
+		if !vv.Dominates(first) || !first.Dominates(vv) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// Project returns a node's merged state for a SKU, via the snapshot read path.
+func (c *Cluster) Project(ctx context.Context, id clock.NodeID, sku string) (*crdt.ItemState, error) {
+	n, ok := c.Nodes[id]
+	if !ok {
+		return nil, fmt.Errorf("unknown node %q", id)
+	}
+	return n.Get(ctx, sku)
+}
+
+// Snapshot forces a snapshot of sku on one node, whatever its event count.
+func (c *Cluster) Snapshot(ctx context.Context, id clock.NodeID, sku string) error {
+	p := &crdt.Projector{Log: c.Logs[id], SnapshotEvery: 1}
+	if err := p.MaybeSnapshot(ctx, sku); err != nil {
+		return fmt.Errorf("snapshot %q/%q: %w", id, sku, err)
+	}
+	return nil
+}
+
+// AckedFloor returns the greatest version vector every *peer* of id has acked
+// holding -- the only safe upper bound for Compact. Compacting past this
+// deletes events a peer has never seen, which is unrecoverable.
+func (c *Cluster) AckedFloor(ctx context.Context, id clock.NodeID) (eventlog.VersionVector, error) {
+	floor := eventlog.VersionVector{}
+	first := true
+	for _, peer := range c.IDs {
+		if peer == id {
+			continue
+		}
+		vv, err := c.Nodes[peer].VersionVector(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("version vector of peer %q: %w", peer, err)
+		}
+		if first {
+			floor, first = vv.Clone(), false
+			continue
+		}
+		for n, seq := range floor {
+			if vv[n] < seq {
+				floor[n] = vv[n]
+			}
+		}
+		for n := range floor {
+			if _, ok := vv[n]; !ok {
+				delete(floor, n)
+			}
+		}
+	}
+	return floor, nil
+}
+```
+
+- [ ] **Step 4: Write the three property checks and `Run`**
+
+Append to `eventlog-lab/internal/jepsenlite/harness.go`:
+
+```go
+// CheckConvergence asserts property 1: every node computes an identical
+// ItemState for every SKU. Compared with ItemState.Equal, not by quantity --
+// two states can agree on quantity and disagree on Name or Deleted.
+func (c *Cluster) CheckConvergence(ctx context.Context, skus []string) error {
+	for _, sku := range skus {
+		var want *crdt.ItemState
+		var wantID clock.NodeID
+		for _, id := range c.IDs {
+			got, err := c.Project(ctx, id, sku)
+			if err != nil {
+				return fmt.Errorf("project %q/%q: %w", id, sku, err)
+			}
+			if want == nil {
+				want, wantID = got, id
+				continue
+			}
+			if !got.Equal(want) {
+				return fmt.Errorf(
+					"convergence violated for %q: %q has quantity %d name %q deleted %v, "+
+						"but %q has quantity %d name %q deleted %v",
+					sku,
+					wantID, want.Quantity(), want.Name.Value, want.Deleted.Value,
+					id, got.Quantity(), got.Name.Value, got.Deleted.Value)
+			}
+		}
+	}
+	return nil
+}
+
+// CheckNoLostEvent asserts property 2: every acknowledged event is present in
+// every replica's log. Only ops that returned a nil error are acknowledged --
+// per the spec, a failed local Append carries no guarantee.
+func (c *Cluster) CheckNoLostEvent(ctx context.Context, acked []eventlog.EventID) error {
+	for _, id := range c.IDs {
+		vv, err := c.Nodes[id].VersionVector(ctx)
+		if err != nil {
+			return fmt.Errorf("version vector of %q: %w", id, err)
+		}
+		for _, want := range acked {
+			if !vv.Contains(want) {
+				return fmt.Errorf(
+					"lost event: %q/%d acknowledged but missing from %q (its vector holds %d)",
+					want.NodeID, want.Seq, id, vv[want.NodeID])
+			}
+		}
+	}
+	return nil
+}
+
+// CheckOrderIndependence asserts property 3: folding a node's own events for a
+// SKU in a random permutation reproduces that node's projection exactly.
+//
+// This check requires an uncompacted log. Compaction deletes events on purpose,
+// so folding from scratch is no longer possible -- the property that must hold
+// against a compacted log is convergence, checked separately.
+func (c *Cluster) CheckOrderIndependence(ctx context.Context, rng *rand.Rand, skus []string) error {
+	for _, id := range c.IDs {
+		for _, sku := range skus {
+			var events []eventlog.Event
+			for e, err := range c.Logs[id].EventsForSKU(ctx, sku, eventlog.VersionVector{}) {
+				if err != nil {
+					return fmt.Errorf("read %q/%q: %w", id, sku, err)
+				}
+				events = append(events, e)
+			}
+			if len(events) == 0 {
+				continue
+			}
+			want, err := c.Project(ctx, id, sku)
+			if err != nil {
+				return fmt.Errorf("project %q/%q: %w", id, sku, err)
+			}
+			rng.Shuffle(len(events), func(i, j int) {
+				events[i], events[j] = events[j], events[i]
+			})
+			got := crdt.NewItemState()
+			for _, e := range events {
+				got.Apply(e)
+			}
+			if !got.Equal(want) {
+				return fmt.Errorf(
+					"order dependence for %q/%q: permuted fold gives quantity %d name %q, "+
+						"projection gives quantity %d name %q",
+					id, sku, got.Quantity(), got.Name.Value,
+					want.Quantity(), want.Name.Value)
+			}
+		}
+	}
+	return nil
+}
+
+// Result is a run report. It is what `lab sim` prints.
+type Result struct {
+	Seed       int64
+	Faults     []string
+	Ops        int
+	Acked      int
+	Failed     int
+	Rounds     int
+	Crashes    int
+	Stats      Stats
+	Quantities map[string]int64
+	Anomalies  []string
+}
+
+// String renders the convergence report.
+func (r Result) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "seed %d  faults [%s]\n", r.Seed, strings.Join(r.Faults, ","))
+	fmt.Fprintf(&b, "ops %d  acked %d  failed %d  sync rounds %d\n",
+		r.Ops, r.Acked, r.Failed, r.Rounds)
+	fmt.Fprintf(&b, "injected: dropped %d  duplicated %d  reordered %d  crashes %d\n",
+		r.Stats.Dropped, r.Stats.Duplicated, r.Stats.Reordered, r.Crashes)
+	b.WriteString("converged state:\n")
+	skus := make([]string, 0, len(r.Quantities))
+	for sku := range r.Quantities {
+		skus = append(skus, sku)
+	}
+	sort.Strings(skus)
+	for _, sku := range skus {
+		fmt.Fprintf(&b, "  %s quantity %d\n", sku, r.Quantities[sku])
+	}
+	if len(r.Anomalies) > 0 {
+		b.WriteString("anomalies (accepted, not rejected -- see README):\n")
+		for _, a := range r.Anomalies {
+			fmt.Fprintf(&b, "  %s\n", a)
+		}
+	}
+	b.WriteString("properties: convergence OK, no lost event OK, order independence OK\n")
+	return b.String()
+}
+
+// Run executes a whole schedule: ops with faults firing, then quiescence, then
+// the three properties. Every returned error names the seed, so a red run is a
+// one-command local reproduction.
+func Run(ctx context.Context, dir string, sch Schedule, f Faults) (Result, error) {
+	c, err := NewCluster(dir, sch, f)
+	if err != nil {
+		return Result{}, fmt.Errorf("seed %d: %w", sch.Seed, err)
+	}
+	defer func() { _ = c.Close() }()
+
+	res := Result{
+		Seed:       sch.Seed,
+		Faults:     f.Names(),
+		Ops:        len(sch.Ops),
+		Quantities: map[string]int64{},
+	}
+	var acked []eventlog.EventID
+	fi := 0
+	for i, op := range sch.Ops {
+		for fi < len(sch.Faults) && sch.Faults[fi].At == i {
+			c.fire(sch.Faults[fi])
+			fi++
+		}
+		id, err := c.ApplyOp(ctx, op)
+		if err != nil {
+			// Not acknowledged, so no guarantee attaches to it. This is the
+			// crash fault's normal outcome, not a failure.
+			res.Failed++
+			continue
+		}
+		res.Acked++
+		acked = append(acked, id)
+		if sch.SyncEvery > 0 && i%sch.SyncEvery == sch.SyncEvery-1 {
+			c.SyncRound(ctx)
+			res.Rounds++
+		}
+	}
+
+	quiesceRounds := 4 * (len(c.IDs) + 1)
+	if err := c.Quiesce(ctx, quiesceRounds); err != nil {
+		return res, fmt.Errorf("seed %d: %w", sch.Seed, err)
+	}
+	res.Rounds += quiesceRounds
+
+	for _, id := range c.IDs {
+		res.Crashes += c.Logs[id].Crashes()
+	}
+	res.Stats = c.Inj.Stats()
+
+	if err := c.CheckConvergence(ctx, sch.SKUs); err != nil {
+		return res, fmt.Errorf("seed %d: %w", sch.Seed, err)
+	}
+	if err := c.CheckNoLostEvent(ctx, acked); err != nil {
+		return res, fmt.Errorf("seed %d: %w", sch.Seed, err)
+	}
+	orderRNG := rand.New(rand.NewSource(sch.Seed ^ 0x5eed))
+	if err := c.CheckOrderIndependence(ctx, orderRNG, sch.SKUs); err != nil {
+		return res, fmt.Errorf("seed %d: %w", sch.Seed, err)
+	}
+
+	for _, sku := range sch.SKUs {
+		st, err := c.Project(ctx, c.IDs[0], sku)
+		if err != nil {
+			return res, fmt.Errorf("seed %d: project %q: %w", sch.Seed, sku, err)
+		}
+		q := st.Quantity()
+		res.Quantities[sku] = q
+		if q < 0 {
+			res.Anomalies = append(res.Anomalies,
+				fmt.Sprintf("%s quantity %d", sku, q))
+		}
+	}
+	return res, nil
+}
+
+// fire applies one scheduled fault event.
+func (c *Cluster) fire(fe FaultEvent) {
+	switch fe.Kind {
+	case "partition":
+		c.Inj.Partition(fe.A, fe.B)
+	case "asym":
+		c.Inj.PartitionOneWay(fe.A, fe.B)
+	case "heal":
+		c.Inj.Heal()
+	case "crash":
+		if l, ok := c.Logs[fe.A]; ok {
+			l.Arm()
+		}
+	}
+}
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cd eventlog-lab && go test ./internal/jepsenlite/ -v`
+Expected: PASS, including `TestConvergenceSurvivesAggressiveCompactionAgainstAStalePeer` and all ten fault combinations at three seeds each.
+
+If a fault combination fails, the message already contains the reproducing
+command. Debug it with `superpowers:systematic-debugging`, not by weakening the
+assertion — a failing property here is the harness doing its job.
+
+- [ ] **Step 6: Run the full gate**
+
+```bash
+cd eventlog-lab
+go test ./... -cover
+golangci-lint run
+```
+Expected: all non-harness packages 100.0%, lint clean.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd eventlog-lab
+git add internal/jepsenlite/
+git commit -m "feat(jepsenlite): deterministic simulator asserting the three properties"
+```
+
+---
+
+### Task 14: The targeted non-random tests
+
+The spec is explicit that four properties must not be left to random search.
+Each gets a dedicated table-driven test that fails loudly and specifically.
+
+**Files:**
+- Create: `eventlog-lab/crdt/commutativity_test.go`
+- Create: `eventlog-lab/crdt/replay_test.go`
+- Create: `eventlog-lab/clock/monotonic_test.go`
+- Create: `eventlog-lab/internal/jepsenlite/negative_test.go`
+
+**Interfaces:**
+- Consumes: `clock.New`, `clock.NodeID`, `clock.HLC`, `clock.WallFunc`, `(*Clock).Now`, `(*Clock).Observe`, `(*Clock).Last`, `HLC.Before` (Tasks 1-2); `eventlog.Event`, `eventlog.EventID`, `eventlog.Kind` constants, `eventlog.MetaSet`, `eventlog.OpenSQLite`, `eventlog.VersionVector` (Tasks 3-4); `crdt.NewItemState`, `(*ItemState).Apply`, `(*ItemState).Fold`, `(*ItemState).Equal`, `(*ItemState).Quantity`, `crdt.Projector` (Tasks 5-6); `NewCluster`, `Cluster.ApplyOp`, `Cluster.Quiesce`, `Cluster.Project`, `Cluster.Inj`, `GenSchedule`, `Faults`, `Op`, `OpReceive`, `OpPick` (Tasks 11-13).
+- Produces: no new production code. Test-only helpers `permutations`, `sampledPermutations` in `crdt/commutativity_test.go`.
+
+**Domain notes for the implementer:**
+- **Commutativity, exhaustively then sampled.** For n ≤ 6 events, enumerate all n! orders. Above that, n! explodes (10! = 3.6M), so sample a fixed number of random permutations from a seeded rng. The assertion is identical in both regimes: every order produces an `Equal` `ItemState`.
+- **HLC monotonicity under backwards jumps** is the single most important clock property. If `Now()` ever regresses, LWW resolves backwards and convergence dies silently — no error, just wrong numbers. Assert both "never regresses" and "`Logical` advances when `Wall` cannot".
+- **Full-log double-replay idempotence.** Fold the entire log once, fold it again into the *same* state, and require no change. This is what proves a re-sync of already-held events is free.
+- **Concurrent decrement below zero converges to −6.** Two nodes each pick 8 of an item holding 10 while partitioned. After healing, every replica reads −6. **This is correct CRDT behavior and the test asserts it as the expected result.** It is not a bug, not skipped, not marked as a known failure. A commutative counter cannot enforce `quantity >= 0` without the coordination local-first exists to avoid; negative stock is a reportable anomaly at central, never a rejected write. If a future change makes this test fail by "fixing" the negative, that change is the regression.
+
+- [ ] **Step 1: Write the commutativity test**
+
+`eventlog-lab/crdt/commutativity_test.go`:
+
+```go
+package crdt
+
+import (
+	"fmt"
+	"math/rand"
+	"testing"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/eventlog"
+)
+
+// permutations returns every ordering of idx. Only ever called for small n.
+func permutations(idx []int) [][]int {
+	if len(idx) <= 1 {
+		return [][]int{append([]int(nil), idx...)}
+	}
+	var out [][]int
+	for i := range idx {
+		rest := make([]int, 0, len(idx)-1)
+		rest = append(rest, idx[:i]...)
+		rest = append(rest, idx[i+1:]...)
+		for _, p := range permutations(rest) {
+			out = append(out, append([]int{idx[i]}, p...))
+		}
+	}
+	return out
+}
+
+// sampledPermutations returns n seeded random orderings of 0..size-1.
+func sampledPermutations(rng *rand.Rand, size, n int) [][]int {
+	out := make([][]int, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, rng.Perm(size))
+	}
+	return out
+}
+
+// buildEvents makes n events across three nodes and every kind, with distinct
+// HLCs so LWW has a strict winner.
+func buildEvents(n int) []eventlog.Event {
+	nodes := []clock.NodeID{"A", "B", "C"}
+	names := []string{"widget", "gasket", "flange"}
+	out := make([]eventlog.Event, 0, n)
+	for i := 0; i < n; i++ {
+		id := nodes[i%len(nodes)]
+		e := eventlog.Event{
+			ID:  eventlog.EventID{NodeID: id, Seq: eventlog.Seq(i/len(nodes) + 1)},
+			HLC: clock.HLC{Wall: int64(100 + i), Logical: uint32(i), NodeID: id},
+			SKU: "SKU-1",
+		}
+		switch i % 4 {
+		case 0:
+			e.Kind, e.Delta = eventlog.KindQuantityDelta, int64(3+i)
+		case 1:
+			e.Kind, e.Delta = eventlog.KindQuantityDelta, -int64(1+i)
+		case 2:
+			name := names[i%len(names)]
+			rp := int64(10 + i)
+			e.Kind, e.Meta = eventlog.KindMetaSet, &eventlog.MetaSet{Name: &name, ReorderPoint: &rp}
+		default:
+			del := i%8 == 3
+			e.Kind, e.DeletedTo = eventlog.KindDeleteSet, &del
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func TestApplyIsCommutativeOverEveryPermutation(t *testing.T) {
+	rng := rand.New(rand.NewSource(1234))
+
+	tests := []struct {
+		name       string
+		size       int
+		exhaustive bool
+		samples    int
+	}{
+		{name: "2 events exhaustive", size: 2, exhaustive: true},
+		{name: "3 events exhaustive", size: 3, exhaustive: true},
+		{name: "4 events exhaustive", size: 4, exhaustive: true},
+		{name: "5 events exhaustive", size: 5, exhaustive: true},
+		{name: "6 events exhaustive", size: 6, exhaustive: true},
+		{name: "12 events sampled", size: 12, samples: 500},
+		{name: "40 events sampled", size: 40, samples: 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events := buildEvents(tt.size)
+
+			var orders [][]int
+			if tt.exhaustive {
+				idx := make([]int, tt.size)
+				for i := range idx {
+					idx[i] = i
+				}
+				orders = permutations(idx)
+				if want := factorial(tt.size); len(orders) != want {
+					t.Fatalf("permutations(%d) = %d orders, want %d",
+						tt.size, len(orders), want)
+				}
+			} else {
+				orders = sampledPermutations(rng, tt.size, tt.samples)
+			}
+
+			var want *ItemState
+			for _, order := range orders {
+				got := NewItemState()
+				for _, i := range order {
+					got.Apply(events[i])
+				}
+				if want == nil {
+					want = got
+					continue
+				}
+				if !got.Equal(want) {
+					t.Fatalf("order %v diverged: quantity %d name %q deleted %v, want quantity %d name %q deleted %v",
+						order, got.Quantity(), got.Name.Value, got.Deleted.Value,
+						want.Quantity(), want.Name.Value, want.Deleted.Value)
+				}
+			}
+		})
+	}
+}
+
+func factorial(n int) int {
+	f := 1
+	for i := 2; i <= n; i++ {
+		f *= i
+	}
+	return f
+}
+
+func TestApplyIsAssociativeAcrossPartitionedSubsets(t *testing.T) {
+	// Associativity in CRDT terms: merging in any grouping is the same. Folding
+	// A then B is folding (A+B), so split an event set every possible way and
+	// require one answer.
+	events := buildEvents(8)
+	var want *ItemState
+	for split := 0; split <= len(events); split++ {
+		got := NewItemState()
+		for _, e := range events[:split] {
+			got.Apply(e)
+		}
+		for _, e := range events[split:] {
+			got.Apply(e)
+		}
+		if want == nil {
+			want = got
+			continue
+		}
+		if !got.Equal(want) {
+			t.Fatalf("split at %d diverged: quantity %d, want %d",
+				split, got.Quantity(), want.Quantity())
+		}
+	}
+	if got := fmt.Sprintf("%d", want.Quantity()); got == "" {
+		t.Fatal("unreachable")
+	}
+}
+```
+
+- [ ] **Step 2: Write the full-log double-replay idempotence test**
+
+`eventlog-lab/crdt/replay_test.go`:
+
+```go
+package crdt
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/eventlog"
+)
+
+// TestFullLogDoubleReplayIsIdempotent folds an entire log into a state, then
+// folds the same log into the same state again, and requires no change. This is
+// what makes re-syncing events a replica already holds free.
+func TestFullLogDoubleReplayIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name   string
+		events []eventlog.Event
+	}{
+		{name: "empty log", events: nil},
+		{name: "one delta", events: buildEvents(1)},
+		{name: "mixed kinds", events: buildEvents(9)},
+		{name: "long log", events: buildEvents(60)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l, err := eventlog.OpenSQLite(filepath.Join(t.TempDir(), "replay.db"))
+			if err != nil {
+				t.Fatalf("OpenSQLite() error = %v", err)
+			}
+			defer func() { _ = l.Close() }()
+			for _, e := range tt.events {
+				if err := l.Append(ctx, e); err != nil {
+					t.Fatalf("Append(%v) error = %v", e.ID, err)
+				}
+			}
+
+			s := NewItemState()
+			if err := s.Fold(l.Since(ctx, eventlog.VersionVector{})); err != nil {
+				t.Fatalf("first Fold() error = %v", err)
+			}
+			first := NewItemState()
+			if err := first.Fold(l.Since(ctx, eventlog.VersionVector{})); err != nil {
+				t.Fatalf("reference Fold() error = %v", err)
+			}
+
+			// Second replay into the SAME state must not move it.
+			if err := s.Fold(l.Since(ctx, eventlog.VersionVector{})); err != nil {
+				t.Fatalf("second Fold() error = %v", err)
+			}
+			if !s.Equal(first) {
+				t.Errorf("double replay changed state: quantity %d, want %d",
+					s.Quantity(), first.Quantity())
+			}
+		})
+	}
+}
+
+// TestDuplicateThroughLogIsAbsorbedButDirectApplyDoubleCounts documents where
+// idempotence actually lives: in Append's primary key, not in Apply.
+func TestDuplicateThroughLogIsAbsorbedButDirectApplyDoubleCounts(t *testing.T) {
+	ctx := context.Background()
+	e := buildEvents(1)[0]
+
+	l, err := eventlog.OpenSQLite(filepath.Join(t.TempDir(), "dup.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	for i := 0; i < 5; i++ {
+		if err := l.Append(ctx, e); err != nil {
+			t.Fatalf("Append() attempt %d error = %v", i, err)
+		}
+	}
+	viaLog := NewItemState()
+	if err := viaLog.Fold(l.Since(ctx, eventlog.VersionVector{})); err != nil {
+		t.Fatalf("Fold() error = %v", err)
+	}
+
+	direct := NewItemState()
+	for i := 0; i < 5; i++ {
+		direct.Apply(e)
+	}
+
+	if viaLog.Quantity() != e.Delta {
+		t.Errorf("log path quantity = %d, want %d (duplicates absorbed by the primary key)",
+			viaLog.Quantity(), e.Delta)
+	}
+	if direct.Quantity() != 5*e.Delta {
+		t.Errorf("direct path quantity = %d, want %d -- Apply is deliberately NOT idempotent; "+
+			"only the log path is safe",
+			direct.Quantity(), 5*e.Delta)
+	}
+}
+```
+
+- [ ] **Step 3: Write the HLC monotonicity test**
+
+`eventlog-lab/clock/monotonic_test.go`:
+
+```go
+package clock
+
+import "testing"
+
+// TestNowIsMonotonicUnderBackwardsWallJumps is the single most important clock
+// property. If Now() ever regresses, LWW resolves backwards and convergence
+// dies with no error at all -- just wrong numbers.
+func TestNowIsMonotonicUnderBackwardsWallJumps(t *testing.T) {
+	tests := []struct {
+		name     string
+		readings []int64
+	}{
+		{name: "monotonic wall", readings: []int64{100, 101, 102, 103}},
+		{name: "stalled wall", readings: []int64{100, 100, 100, 100}},
+		{name: "single backwards step", readings: []int64{100, 101, 50, 51}},
+		{name: "large backwards jump", readings: []int64{1_000_000, 1_000_001, 1, 2}},
+		{name: "repeated backwards jumps", readings: []int64{100, 90, 80, 70, 60}},
+		{name: "zigzag", readings: []int64{100, 50, 200, 60, 300, 70}},
+		{name: "negative readings", readings: []int64{10, -100, -200, 5}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			i := 0
+			wall := func() int64 {
+				v := tt.readings[i]
+				if i < len(tt.readings)-1 {
+					i++
+				}
+				return v
+			}
+			c := New("A", wall)
+
+			prev := c.Now()
+			for step := 1; step < len(tt.readings)+3; step++ {
+				got := c.Now()
+				if got.Before(prev) {
+					t.Fatalf("step %d: Now() = %+v regressed before %+v", step, got, prev)
+				}
+				if got == prev {
+					t.Fatalf("step %d: Now() = %+v repeated; timestamps must be distinct",
+						step, got)
+				}
+				if got.Wall == prev.Wall && got.Logical <= prev.Logical {
+					t.Fatalf("step %d: Wall stalled at %d but Logical did not advance (%d -> %d)",
+						step, got.Wall, prev.Logical, got.Logical)
+				}
+				prev = got
+			}
+			if last := c.Last(); last != prev {
+				t.Errorf("Last() = %+v, want %+v", last, prev)
+			}
+		})
+	}
+}
+
+// TestObserveKeepsCausalityAcrossABackwardsJumpingClock asserts the reason
+// Observe exists: a local write made after receiving a remote event must sort
+// after it, even if the local wall clock is behind and jumping backwards.
+func TestObserveKeepsCausalityAcrossABackwardsJumpingClock(t *testing.T) {
+	tests := []struct {
+		name   string
+		remote HLC
+	}{
+		{name: "remote slightly ahead", remote: HLC{Wall: 105, NodeID: "B"}},
+		{name: "remote far ahead", remote: HLC{Wall: 9_000_000, NodeID: "B"}},
+		{name: "remote equal wall", remote: HLC{Wall: 100, Logical: 7, NodeID: "B"}},
+		{name: "remote behind", remote: HLC{Wall: 1, NodeID: "B"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			readings := []int64{100, 99, 98, 97}
+			i := 0
+			c := New("A", func() int64 {
+				v := readings[i]
+				if i < len(readings)-1 {
+					i++
+				}
+				return v
+			})
+			_ = c.Now()
+
+			observed := c.Observe(tt.remote)
+			if tt.remote.Before(observed) == false && observed != tt.remote {
+				t.Fatalf("Observe(%+v) = %+v, which does not sort after the remote",
+					tt.remote, observed)
+			}
+			next := c.Now()
+			if !tt.remote.Before(next) {
+				t.Errorf("after Observe(%+v), Now() = %+v does not sort after the remote; "+
+					"a later local write would lose the LWW conflict it causally follows",
+					tt.remote, next)
+			}
+			if !observed.Before(next) {
+				t.Errorf("Now() = %+v does not follow Observe's result %+v", next, observed)
+			}
+		})
+	}
+}
+```
+
+- [ ] **Step 4: Write the concurrent-decrement-below-zero test**
+
+`eventlog-lab/internal/jepsenlite/negative_test.go`:
+
+```go
+package jepsenlite
+
+import (
+	"context"
+	"testing"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+)
+
+// TestConcurrentPickBelowZeroConvergesToNegativeSix is the spec's headline
+// example, and it asserts the negative as the CORRECT result.
+//
+// An item holds 10 units. Two nodes are partitioned and each picks 8. Both
+// writes are valid locally -- neither node can see the other. After healing,
+// every replica converges on 10 - 8 - 8 = -6.
+//
+// This is correct CRDT behavior and this project accepts it. A commutative
+// counter cannot enforce "quantity >= 0" without exactly the coordination that
+// local-first architecture exists to avoid. Negative stock is a reportable
+// anomaly at central, never a rejected write. If a future change makes this
+// test fail by "fixing" the negative, that change is the regression.
+func TestConcurrentPickBelowZeroConvergesToNegativeSix(t *testing.T) {
+	ctx := context.Background()
+	sch := GenSchedule(2026, 3, 0, Faults{Partition: true})
+	c, err := NewCluster(t.TempDir(), sch, Faults{Partition: true})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Ten units, known to everyone.
+	if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 10}); err != nil {
+		t.Fatalf("Receive(10) error = %v", err)
+	}
+	if err := c.Quiesce(ctx, 8); err != nil {
+		t.Fatalf("Quiesce() error = %v", err)
+	}
+	for _, id := range c.IDs {
+		st, err := c.Project(ctx, id, "SKU-0")
+		if err != nil {
+			t.Fatalf("Project(%q) error = %v", id, err)
+		}
+		if got := st.Quantity(); got != 10 {
+			t.Fatalf("pre-partition quantity at %q = %d, want 10", id, got)
+		}
+	}
+
+	// Partition N0 from N1 in both directions, then each picks 8.
+	c.Inj.Partition("N0", "N1")
+	if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpPick, SKU: "SKU-0", Qty: 8}); err != nil {
+		t.Fatalf("N0 Pick(8) error = %v", err)
+	}
+	if _, err := c.ApplyOp(ctx, Op{Node: "N1", Kind: OpPick, SKU: "SKU-0", Qty: 8}); err != nil {
+		t.Fatalf("N1 Pick(8) error = %v", err)
+	}
+
+	// Each node sees only its own pick while partitioned.
+	for _, tc := range []struct {
+		id   clock.NodeID
+		want int64
+	}{{"N0", 2}, {"N1", 2}} {
+		st, err := c.Project(ctx, tc.id, "SKU-0")
+		if err != nil {
+			t.Fatalf("Project(%q) error = %v", tc.id, err)
+		}
+		if got := st.Quantity(); got != tc.want {
+			t.Errorf("during partition, %q quantity = %d, want %d", tc.id, got, tc.want)
+		}
+	}
+
+	// Heal and converge.
+	if err := c.Quiesce(ctx, 16); err != nil {
+		t.Fatalf("Quiesce() after heal error = %v", err)
+	}
+	for _, id := range c.IDs {
+		st, err := c.Project(ctx, id, "SKU-0")
+		if err != nil {
+			t.Fatalf("Project(%q) error = %v", id, err)
+		}
+		if got := st.Quantity(); got != -6 {
+			t.Errorf("converged quantity at %q = %d, want -6 "+
+				"(10 - 8 - 8; negative stock is accepted, not rejected)", id, got)
+		}
+	}
+	if err := c.CheckConvergence(ctx, []string{"SKU-0"}); err != nil {
+		t.Errorf("CheckConvergence() = %v, want nil", err)
+	}
+}
+```
+
+- [ ] **Step 5: Run the tests to verify they fail where they should**
+
+Run:
+```bash
+cd eventlog-lab
+go test ./crdt/ -run 'Commutative|Associative|Replay|Duplicate' -v
+go test ./clock/ -run 'Monotonic|Observe' -v
+go test ./internal/jepsenlite/ -run NegativeSix -v
+```
+Expected: these are assertions over code that already exists, so they should
+**pass immediately**. If any fails, the failure is a real bug in Tasks 1-13 —
+fix the production code, never the assertion. In particular:
+- a commutativity failure means `Apply` is not order-independent;
+- a monotonicity failure means `Now()` is not clamping a backwards jump;
+- a `-6` failure means something is rejecting a valid concurrent write.
+
+- [ ] **Step 6: Run the full gate**
+
+```bash
+cd eventlog-lab
+go test ./... -cover -race
+golangci-lint run
+```
+Expected: all non-harness packages 100.0%, lint clean, no data races.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd eventlog-lab
+git add clock/ crdt/ internal/jepsenlite/
+git commit -m "test: targeted commutativity, monotonicity, replay, and negative-stock tests"
+```
+
+---
+
+### Task 15: `cmd/lab/` — the CLI
+
+Exactly the five commands the spec lists, and nothing more. All logic lives in a
+testable `run(args, stdout, stderr) error`; `main` is three lines.
+
+**Files:**
+- Create: `eventlog-lab/cmd/lab/main.go`
+- Test: `eventlog-lab/cmd/lab/main_test.go`
+- Modify: `eventlog-lab/README.md` (CLI section)
+
+**Interfaces:**
+- Consumes: `clock.NodeID` (Task 1); `eventlog.OpenSQLite`, `*eventlog.SQLiteLog` (Task 4); `crdt.SQLLog`, `crdt.ItemState` (Tasks 5-6); `node.New`, `node.Config`, `*node.Node`, `(*Node).Receive`, `(*Node).Pick`, `(*Node).Get` (Task 7); `sync.NewClient`, `sync.NewGRPCDialer`, `sync.NewServer`, `sync.Register` (Tasks 8-9); `jepsenlite.ParseFaults`, `jepsenlite.GenSchedule`, `jepsenlite.Run`, `jepsenlite.Result` (Tasks 11-13).
+- Produces:
+  - `func run(args []string, stdout, stderr io.Writer) error` — dispatches the subcommand.
+  - `func main()` — `os.Exit(1)` on error.
+
+**Commands, exactly as the spec specifies them:**
+
+```
+lab node  --id A --db a.db --central localhost:9000
+lab op    --id A receive SKU-1 10
+lab op    --id A pick    SKU-1 3
+lab state --id A SKU-1
+lab sim   --seed 42 --nodes 3 --ops 500 --faults partition,skew,dup
+```
+
+**Domain notes for the implementer:**
+- `lab op` takes only `receive` and `pick`. `SetMeta` and `Delete` exist on the node API and are driven by the harness, but the spec's CLI does not expose them — do not add them.
+- `lab node` runs a server *and* a periodic sync client against `--central`, using `sync.NewGRPCDialer`. It blocks until the context is cancelled (SIGINT). `--db` is a file path; `lab op` and `lab state` open the same file, which is why they can run as separate processes.
+- `lab op` and `lab state` are one-shot: open the DB, do the thing, close, exit. They do not sync — a node stays fully usable offline, and the spec's whole point is that a local op needs no network.
+- `lab sim` needs no database on disk beyond a temp directory, prints `Result.String()`, and exits non-zero if any property was violated — with the seed in the message, so CI output is a reproduction recipe.
+- 100% coverage applies here too. That is the reason `run` takes `args` and writers instead of reading `os.Args` and printing to `os.Stdout`: every branch is reachable from a test. `lab node` is the one command a unit test cannot run to completion (it blocks); test its argument validation and leave the serve loop to a short context deadline.
+
+- [ ] **Step 1: Write the failing CLI tests**
+
+`eventlog-lab/cmd/lab/main_test.go`:
+
+```go
+package main
+
+import (
+	"bytes"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// exec runs the CLI and returns stdout, stderr, and the error.
+func exec(t *testing.T, args ...string) (string, string, error) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	err := run(args, &out, &errOut)
+	return out.String(), errOut.String(), err
+}
+
+func TestRunUsageErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantMsg string
+	}{
+		{name: "no args", args: nil, wantMsg: "usage"},
+		{name: "unknown command", args: []string{"frobnicate"}, wantMsg: "unknown command"},
+		{name: "op without id", args: []string{"op", "receive", "SKU-1", "10"}, wantMsg: "--id"},
+		{name: "op without db", args: []string{"op", "--id", "A", "receive", "SKU-1", "10"}, wantMsg: "--db"},
+		{
+			name:    "op unknown verb",
+			args:    []string{"op", "--id", "A", "--db", "x.db", "teleport", "SKU-1", "1"},
+			wantMsg: "unknown op",
+		},
+		{
+			name:    "op missing quantity",
+			args:    []string{"op", "--id", "A", "--db", "x.db", "receive", "SKU-1"},
+			wantMsg: "usage",
+		},
+		{
+			name:    "op non-numeric quantity",
+			args:    []string{"op", "--id", "A", "--db", "x.db", "receive", "SKU-1", "lots"},
+			wantMsg: "quantity",
+		},
+		{name: "state without sku", args: []string{"state", "--id", "A", "--db", "x.db"}, wantMsg: "usage"},
+		{name: "node without central", args: []string{"node", "--id", "A", "--db", "x.db"}, wantMsg: "--central"},
+		{
+			name:    "sim unknown fault",
+			args:    []string{"sim", "--seed", "1", "--nodes", "2", "--ops", "5", "--faults", "gremlins"},
+			wantMsg: "unknown fault",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := exec(t, tt.args...)
+			if err == nil {
+				t.Fatalf("run(%v) = nil, want error", tt.args)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), tt.wantMsg) {
+				t.Errorf("run(%v) error = %q, want it to mention %q", tt.args, err, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestOpAndStateRoundTrip(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "a.db")
+
+	if _, _, err := exec(t, "op", "--id", "A", "--db", db, "receive", "SKU-1", "10"); err != nil {
+		t.Fatalf("receive error = %v", err)
+	}
+	if _, _, err := exec(t, "op", "--id", "A", "--db", db, "pick", "SKU-1", "3"); err != nil {
+		t.Fatalf("pick error = %v", err)
+	}
+	out, _, err := exec(t, "state", "--id", "A", "--db", db, "SKU-1")
+	if err != nil {
+		t.Fatalf("state error = %v", err)
+	}
+	for _, want := range []string{"SKU-1", "7"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("state output = %q, missing %q", out, want)
+		}
+	}
+}
+
+func TestOpPrintsTheAcknowledgedEventID(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "b.db")
+	out, _, err := exec(t, "op", "--id", "B", "--db", db, "receive", "SKU-2", "4")
+	if err != nil {
+		t.Fatalf("receive error = %v", err)
+	}
+	if !strings.Contains(out, "B/1") {
+		t.Errorf("op output = %q, want the event id B/1", out)
+	}
+}
+
+func TestOpRejectsNonPositiveQuantity(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "c.db")
+	for _, qty := range []string{"0", "-5"} {
+		if _, _, err := exec(t, "op", "--id", "C", "--db", db, "receive", "SKU-1", qty); err == nil {
+			t.Errorf("receive %s = nil, want error", qty)
+		}
+	}
+}
+
+func TestStateOnAnUnknownSKUReportsZero(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "d.db")
+	out, _, err := exec(t, "state", "--id", "D", "--db", db, "SKU-nope")
+	if err != nil {
+		t.Fatalf("state error = %v", err)
+	}
+	if !strings.Contains(out, "0") {
+		t.Errorf("state output = %q, want quantity 0 for an unknown SKU", out)
+	}
+}
+
+func TestSimPrintsAConvergenceReport(t *testing.T) {
+	tests := []struct {
+		name   string
+		faults string
+	}{
+		{name: "no faults", faults: ""},
+		{name: "spec example", faults: "partition,skew,dup"},
+		{name: "all faults", faults: "all"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := []string{"sim", "--seed", "42", "--nodes", "3", "--ops", "60"}
+			if tt.faults != "" {
+				args = append(args, "--faults", tt.faults)
+			}
+			out, _, err := exec(t, args...)
+			if err != nil {
+				t.Fatalf("sim error = %v", err)
+			}
+			for _, want := range []string{"seed 42", "ops 60", "convergence OK"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("sim output = %q, missing %q", out, want)
+				}
+			}
+		})
+	}
+}
+
+func TestNodeValidatesArgsBeforeDialing(t *testing.T) {
+	// A bad address must fail fast rather than block: no server is listening.
+	db := filepath.Join(t.TempDir(), "n.db")
+	_, _, err := exec(t, "node", "--id", "N", "--db", db,
+		"--central", "127.0.0.1:1", "--once")
+	if err == nil {
+		t.Fatalf("node --once against a dead address = nil, want error")
+	}
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd eventlog-lab && go test ./cmd/lab/ -v`
+Expected: FAIL to build — `undefined: run`.
+
+- [ ] **Step 3: Write the CLI**
+
+`eventlog-lab/cmd/lab/main.go`:
+
+```go
+// Command lab drives an eventlog-lab node and the fault simulator.
+//
+//	lab node  --id A --db a.db --central localhost:9000
+//	lab op    --id A --db a.db receive SKU-1 10
+//	lab op    --id A --db a.db pick    SKU-1 3
+//	lab state --id A --db a.db SKU-1
+//	lab sim   --seed 42 --nodes 3 --ops 500 --faults partition,skew,dup
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"time"
+
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/eventlog"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/internal/jepsenlite"
+	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/node"
+	syncpkg "github.com/dhiazfathra/local-first-architecture/eventlog-lab/sync"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+const usage = `usage:
+  lab node  --id ID --db FILE --central ADDR [--listen ADDR] [--every DUR] [--once]
+  lab op    --id ID --db FILE (receive|pick) SKU QTY
+  lab state --id ID --db FILE SKU
+  lab sim   [--seed N] [--nodes N] [--ops N] [--faults LIST]
+
+faults: partition, asym, skew, dup, reorder, crash, slow, all`
+
+func main() {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, "lab:", err)
+		os.Exit(1)
+	}
+}
+
+// run dispatches a subcommand. It takes args and writers so every branch is
+// reachable from a test.
+func run(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New(usage)
+	}
+	switch args[0] {
+	case "node":
+		return runNode(args[1:], stdout, stderr)
+	case "op":
+		return runOp(args[1:], stdout)
+	case "state":
+		return runState(args[1:], stdout)
+	case "sim":
+		return runSim(args[1:], stdout)
+	default:
+		return fmt.Errorf("unknown command %q\n%s", args[0], usage)
+	}
+}
+
+// openNode opens the on-disk log and wires a node around it.
+func openNode(id, db string) (*node.Node, *eventlog.SQLiteLog, error) {
+	if id == "" {
+		return nil, nil, errors.New("--id is required")
+	}
+	if db == "" {
+		return nil, nil, errors.New("--db is required")
+	}
+	l, err := eventlog.OpenSQLite(db)
+	if err != nil {
+		return nil, nil, err
+	}
+	n, err := node.New(node.Config{
+		ID:            clock.NodeID(id),
+		Log:           l,
+		SnapshotEvery: 64,
+	})
+	if err != nil {
+		_ = l.Close()
+		return nil, nil, err
+	}
+	return n, l, nil
+}
+
+// runOp performs one local receive or pick. It never syncs: a node is fully
+// usable offline, which is the entire point of the architecture.
+func runOp(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("op", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	id := fs.String("id", "", "node id")
+	db := fs.String("db", "", "log file")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("%w\n%s", err, usage)
+	}
+	rest := fs.Args()
+	if len(rest) != 3 {
+		return errors.New(usage)
+	}
+	qty, err := strconv.ParseInt(rest[2], 10, 64)
+	if err != nil {
+		return fmt.Errorf("quantity %q is not a number", rest[2])
+	}
+
+	n, l, err := openNode(*id, *db)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = l.Close() }()
+
+	ctx := context.Background()
+	var eid eventlog.EventID
+	switch rest[0] {
+	case "receive":
+		eid, err = n.Receive(ctx, rest[1], qty)
+	case "pick":
+		eid, err = n.Pick(ctx, rest[1], qty)
+	default:
+		return fmt.Errorf("unknown op %q; want receive or pick", rest[0])
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "acked %s/%d\n", eid.NodeID, eid.Seq)
+	return nil
+}
+
+// runState prints the merged state of one SKU.
+func runState(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("state", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	id := fs.String("id", "", "node id")
+	db := fs.String("db", "", "log file")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("%w\n%s", err, usage)
+	}
+	if fs.NArg() != 1 {
+		return errors.New(usage)
+	}
+	n, l, err := openNode(*id, *db)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = l.Close() }()
+
+	st, err := n.Get(context.Background(), fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "%s quantity %d name %q reorder_point %d deleted %v\n",
+		fs.Arg(0), st.Quantity(), st.Name.Value, st.ReorderPoint.Value, st.Deleted.Value)
+	return nil
+}
+
+// runNode serves replication and periodically syncs with central. It blocks
+// until interrupted, unless --once is given.
+func runNode(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("node", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	id := fs.String("id", "", "node id")
+	db := fs.String("db", "", "log file")
+	central := fs.String("central", "", "central address")
+	listen := fs.String("listen", "", "address to serve replication on")
+	every := fs.Duration("every", 5*time.Second, "sync interval")
+	once := fs.Bool("once", false, "sync once and exit")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("%w\n%s", err, usage)
+	}
+	if *central == "" {
+		return errors.New("--central is required")
+	}
+	n, l, err := openNode(*id, *db)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = l.Close() }()
+
+	client := syncpkg.NewClient(n, syncpkg.NewGRPCDialer(
+		grpc.WithTransportCredentials(insecure.NewCredentials())), 64)
+
+	if *once {
+		rep, err := client.SyncOnce(context.Background(), *central)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "synced with %s: sent %d received %d\n",
+			rep.PeerID, rep.Sent, rep.Received)
+		return nil
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	if *listen != "" {
+		ln, err := net.Listen("tcp", *listen)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", *listen, err)
+		}
+		gs := grpc.NewServer()
+		syncpkg.Register(gs, syncpkg.NewServer(n, 64))
+		go func() {
+			if err := gs.Serve(ln); err != nil {
+				fmt.Fprintln(stderr, "serve:", err)
+			}
+		}()
+		defer gs.Stop()
+		fmt.Fprintf(stdout, "node %s serving on %s\n", n.ID(), *listen)
+	}
+
+	ticker := time.NewTicker(*every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			// Sync failures are expected offline; a node stays usable.
+			// Identity jitter: the CLI is not the place to add randomness.
+			rep, err := client.SyncWithBackoff(ctx, *central, 4, 200*time.Millisecond,
+				func(d time.Duration) time.Duration { return d })
+			if err != nil {
+				fmt.Fprintln(stderr, "sync:", err)
+				continue
+			}
+			fmt.Fprintf(stdout, "synced with %s: sent %d received %d\n",
+				rep.PeerID, rep.Sent, rep.Received)
+		}
+	}
+}
+
+// runSim runs the harness from the command line and prints a convergence
+// report. It exits non-zero on a property violation, with the seed in the
+// message so CI output is a reproduction recipe.
+func runSim(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("sim", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	seed := fs.Int64("seed", 1, "random seed")
+	nodes := fs.Int("nodes", 3, "node count")
+	ops := fs.Int("ops", 500, "operation count")
+	faults := fs.String("faults", "", "comma-separated fault list")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("%w\n%s", err, usage)
+	}
+	f, err := jepsenlite.ParseFaults(*faults)
+	if err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "lab-sim-")
+	if err != nil {
+		return fmt.Errorf("temp dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	sch := jepsenlite.GenSchedule(*seed, *nodes, *ops, f)
+	res, err := jepsenlite.Run(context.Background(), dir, sch, f)
+	if err != nil {
+		return fmt.Errorf("property violated -- reproduce with "+
+			"`lab sim --seed %d --nodes %d --ops %d --faults %s`: %w",
+			*seed, *nodes, *ops, *faults, err)
+	}
+	fmt.Fprint(stdout, res.String())
+	return nil
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cd eventlog-lab && go test ./cmd/lab/ -v -cover`
+Expected: PASS. If `node --once` against `127.0.0.1:1` hangs instead of failing,
+`NewGRPCDialer` is not failing fast — add `grpc.WithBlock()` plus a dial timeout
+inside `SyncOnce`'s context in Task 9's dialer, and note the change.
+
+- [ ] **Step 5: Document the CLI in the README**
+
+Replace the `## Running` section of `eventlog-lab/README.md` with:
+
+```markdown
+## Running
+
+```bash
+go test ./... -cover          # unit, property, and harness tests
+```
+
+### CLI
+
+```bash
+# Serve replication and sync with central every 5s.
+lab node --id A --db a.db --central localhost:9000 --listen :9001
+
+# Local ops. These never touch the network -- a node is fully usable offline.
+lab op --id A --db a.db receive SKU-1 10
+lab op --id A --db a.db pick    SKU-1 3
+
+# Merged state of one SKU.
+lab state --id A --db a.db SKU-1
+
+# The harness, from the command line. Prints a convergence report; exits
+# non-zero with a reproducing seed if any property is violated.
+lab sim --seed 42 --nodes 3 --ops 500 --faults partition,skew,dup
+```
+
+Faults: `partition`, `asym`, `skew`, `dup`, `reorder`, `crash`, `slow`, `all`.
+
+Central-store tests need Postgres:
+
+```bash
+docker run --rm -d -e POSTGRES_PASSWORD=pg -p 5432:5432 postgres:16
+export EVENTLOG_LAB_PG_DSN='postgres://postgres:pg@127.0.0.1:5432/postgres?sslmode=disable'
+```
+```
+
+- [ ] **Step 6: Run the full gate**
+
+```bash
+cd eventlog-lab
+go test ./... -cover -race
+golangci-lint run
+go vet ./...
+go run ./cmd/lab sim --seed 42 --nodes 3 --ops 500 --faults all
+```
+Expected: every package except `internal/jepsenlite` at 100.0%; lint clean; the
+`sim` run prints a convergence report and exits zero.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd eventlog-lab
+git add cmd/ README.md
+git commit -m "feat(cmd/lab): node, op, state, and sim commands"
+```
+
+---
