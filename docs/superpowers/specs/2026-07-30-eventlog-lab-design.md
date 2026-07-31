@@ -18,6 +18,8 @@ Success criterion: a property-based harness that partitions nodes, skews clocks,
 
 Authentication, multi-tenancy, UI, HTTP API, garbage collection of tombstones beyond compaction, real ERP domain rules, performance tuning. Explicitly not a library for reuse — that is `localfirst-go`.
 
+Accepted limitation this implies: `Append`'s idempotence is keyed on `(NodeID, Seq)` alone. A malicious or buggy peer that resubmits the same ID with different contents is indistinguishable from a legitimate duplicate — `ON CONFLICT DO NOTHING` keeps whichever copy arrived first and neither side is alerted. Detecting that requires authenticating which node is entitled to write a given `NodeID`'s sequence, which is exactly the authentication this project defers. Out of scope here; not a gap in the CRDT design.
+
 ## Domain (deliberately toy)
 
 One aggregate: `StockItem`, keyed by `SKU` (string).
