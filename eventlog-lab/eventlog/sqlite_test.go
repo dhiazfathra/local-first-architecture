@@ -346,6 +346,12 @@ func TestClosedLogReturnsErrors(t *testing.T) {
 	if sawErr == nil {
 		t.Error("Since() on a closed log yielded no error, want one")
 	}
+	if err := l.Compact(ctx, VersionVector{}); err == nil {
+		t.Error("Compact() on a closed log error = nil, want an error")
+	}
+	if _, err := l.CountForSKU(ctx, "SKU-1"); err == nil {
+		t.Error("CountForSKU() on a closed log error = nil, want an error")
+	}
 }
 
 func TestDSNReportsOpenPath(t *testing.T) {
@@ -500,4 +506,4 @@ func TestAppendLocalFailsWhenInsertErrors(t *testing.T) {
 
 // SQLiteLog must satisfy Log.
 // uncommented in Task 6, once Compact exists
-// var _ Log = (*SQLiteLog)(nil)
+var _ Log = (*SQLiteLog)(nil)

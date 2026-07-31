@@ -259,3 +259,103 @@ func (l *SQLiteLog) SaveSnapshot(ctx context.Context, sku string, state []byte, 
 	}
 	return nil
 }
+
+// CountForSKU reports how many events remain for sku. Used by the snapshot
+// trigger and by compaction tests.
+func (l *SQLiteLog) CountForSKU(ctx context.Context, sku string) (int, error) {
+	var n int
+	if err := l.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE sku = ?`, sku).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count events for %q: %w", sku, err)
+	}
+	return n, nil
+}
+
+// Compact deletes an event only when BOTH hold:
+//
+//  1. upTo dominates it -- every peer has acked holding it, so nobody will ask
+//     for it again; and
+//  2. a snapshot for its SKU already folds it in, so our own read path does not
+//     need it.
+//
+// Both conditions are mandatory. Deleting an event a peer has not yet seen
+// loses it permanently: there is no recovery path.
+func (l *SQLiteLog) Compact(ctx context.Context, upTo VersionVector) error {
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin compact tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	covered, err := snapshotCoverage(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for sku, snapVV := range covered {
+		// Intersect: an event survives if either gate says keep.
+		safe := VersionVector{}
+		for node, seq := range snapVV {
+			if peerSeq, ok := upTo[node]; ok {
+				safe[node] = min(seq, peerSeq)
+			}
+		}
+		for node, seq := range safe {
+			// VersionVector reports each node's highest gap-free seq starting
+			// at 1. Deleting this node's covered prefix while a later,
+			// uncovered event from the same node survives (in any SKU -- seq
+			// is a per-node counter shared across SKUs) would strand that
+			// event: it would still be held, but the gap left behind makes
+			// VersionVector stop reporting the node at all, which would make
+			// us re-request data we already have, or make a peer believe we
+			// lack data we hold. So skip this node's deletion entirely rather
+			// than risk that; it will compact cleanly once nothing of its
+			// remains beyond the safe point.
+			var stranded bool
+			if err := tx.QueryRowContext(ctx,
+				`SELECT EXISTS(SELECT 1 FROM events WHERE node_id = ? AND seq > ?)`,
+				string(node), int64(seq)).Scan(&stranded); err != nil {
+				return fmt.Errorf("check stranding for %q/%q: %w", sku, node, err)
+			}
+			if stranded {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM events WHERE sku = ? AND node_id = ? AND seq <= ?`,
+				sku, string(node), int64(seq)); err != nil {
+				return fmt.Errorf("compact %q/%q: %w", sku, node, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit compact: %w", err)
+	}
+	return nil
+}
+
+// snapshotCoverage reads every snapshot's covered version vector.
+func snapshotCoverage(ctx context.Context, tx *sql.Tx) (map[string]VersionVector, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT sku, covers FROM snapshots`)
+	if err != nil {
+		return nil, fmt.Errorf("query snapshots: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]VersionVector{}
+	for rows.Next() {
+		var (
+			sku    string
+			covers []byte
+		)
+		if err := rows.Scan(&sku, &covers); err != nil {
+			return nil, fmt.Errorf("scan snapshot row: %w", err)
+		}
+		vv := VersionVector{}
+		if err := json.Unmarshal(covers, &vv); err != nil {
+			return nil, fmt.Errorf("decode covers for %q: %w", sku, err)
+		}
+		out[sku] = vv
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshots: %w", err)
+	}
+	return out, nil
+}
