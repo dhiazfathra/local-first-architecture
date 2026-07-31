@@ -24,7 +24,7 @@ import (
 // used solely by tests behind this build tag would otherwise trip the
 // unused-method lint check in the default build.
 func (l *PostgresLog) truncateAll(ctx context.Context) error {
-	if _, err := l.pool.Exec(ctx, `TRUNCATE events, snapshots, sync_cursors, projections`); err != nil {
+	if _, err := l.pool.Exec(ctx, `TRUNCATE events, snapshots, sync_cursors, seq_watermark, projections`); err != nil {
 		return fmt.Errorf("truncate: %w", err)
 	}
 	return nil
@@ -283,4 +283,8 @@ func TestPostgresCompactDoesNotStrandLaterEventsAcrossSKUs(t *testing.T) {
 	if n2 != 1 {
 		t.Fatalf("SKU-2 events after compaction = %d, want 1", n2)
 	}
+}
+
+func TestPostgresAppendLocalDoesNotReuseSeqAfterCompact(t *testing.T) {
+	appendLocalSeqAfterCompact(context.Background(), t, newPGLog(t))
 }

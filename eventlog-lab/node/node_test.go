@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"iter"
 	"path/filepath"
 	"testing"
 
@@ -427,5 +428,70 @@ func TestMergeProjectionSinkUpsertFailure(t *testing.T) {
 	}
 	if accepted != 1 {
 		t.Fatalf("accepted = %d, want 1", accepted)
+	}
+}
+
+// TestNewRecoversClockFromLog proves the HLC is seeded from the log at
+// startup. Every `lab op` is a fresh process: without recovery a node whose
+// wall clock has jumped backwards since it last wrote emits a stamp sorting
+// BEFORE its own earlier events, and LWW then silently rejects every
+// metadata write it makes until wall time catches up.
+func TestNewRecoversClockFromLog(t *testing.T) {
+	ctx := context.Background()
+	db := filepath.Join(t.TempDir(), "A.db")
+
+	l, err := eventlog.OpenSQLite(db)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	first, err := New(Config{ID: "A", Log: l, Wall: func() int64 { return 5_000 }})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := first.Receive(ctx, "SKU-1", 3); err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	written := first.Clock().Last()
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	// Reopen with a wall clock deliberately set BEFORE the last written HLC.
+	l2, err := eventlog.OpenSQLite(db)
+	if err != nil {
+		t.Fatalf("OpenSQLite() reopen error = %v", err)
+	}
+	defer func() { _ = l2.Close() }()
+	restarted, err := New(Config{ID: "A", Log: l2, Wall: func() int64 { return 1_000 }})
+	if err != nil {
+		t.Fatalf("New() reopen error = %v", err)
+	}
+	if _, err := restarted.SetMeta(ctx, "SKU-1", ptr("widget"), nil); err != nil {
+		t.Fatalf("SetMeta() error = %v", err)
+	}
+	if got := restarted.Clock().Last(); !written.Before(got) {
+		t.Fatalf("restarted stamp %+v does not sort after the stored %+v -- "+
+			"the clock was not recovered from the log", got, written)
+	}
+}
+
+func TestNewSurfacesClockRecoveryError(t *testing.T) {
+	l, err := eventlog.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	if _, err := New(Config{ID: "A", Log: brokenSinceLog{l}}); err == nil {
+		t.Fatal("New() error = nil with an unreadable log, want an error")
+	}
+}
+
+// brokenSinceLog fails only on Since, which is the read New uses to recover
+// the clock.
+type brokenSinceLog struct{ crdt.SQLLog }
+
+func (brokenSinceLog) Since(context.Context, eventlog.VersionVector) iter.Seq2[eventlog.Event, error] {
+	return func(yield func(eventlog.Event, error) bool) {
+		yield(eventlog.Event{}, errors.New("boom"))
 	}
 }

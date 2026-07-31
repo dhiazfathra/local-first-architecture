@@ -70,6 +70,15 @@ func (l *SQLiteLog) Append(ctx context.Context, e Event) error {
 
 // AppendLocal allocates the next Seq for the node mint stamps and inserts in
 // the same transaction, so no crash can leave a sequence gap.
+//
+// The high-water mark is MAX(surviving rows, seq_watermark), never MAX(seq)
+// alone: compaction deletes rows, and allocating over survivors only would
+// re-issue a seq this node already emitted. That collision is silent in both
+// directions -- our own snapshot's covers vector already contains the id (so
+// the read path skips the "new" event), and every peer's Append idempotently
+// drops it on arrival. Losing an acknowledged event with no error anywhere is
+// the worst failure this codebase can have, so the watermark is durable and
+// independent of which rows currently survive.
 func (l *SQLiteLog) AppendLocal(ctx context.Context, mint func(Seq) Event) (Event, error) {
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -80,8 +89,11 @@ func (l *SQLiteLog) AppendLocal(ctx context.Context, mint func(Seq) Event) (Even
 	probe := mint(0)
 	var next int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE node_id = ?`,
-		string(probe.ID.NodeID)).Scan(&next); err != nil {
+		`SELECT MAX(
+		   COALESCE((SELECT MAX(seq) FROM events WHERE node_id = ?), 0),
+		   COALESCE((SELECT seq FROM seq_watermark WHERE node_id = ?), 0)
+		 ) + 1`,
+		string(probe.ID.NodeID), string(probe.ID.NodeID)).Scan(&next); err != nil {
 		return Event{}, fmt.Errorf("allocate seq for %q: %w", probe.ID.NodeID, err)
 	}
 
@@ -318,6 +330,16 @@ func (l *SQLiteLog) Compact(ctx context.Context, upTo VersionVector) error {
 			}
 			if stranded {
 				continue
+			}
+			// Raise the durable high-water mark BEFORE dropping the rows, so
+			// a crash mid-compaction can only over-report, never re-issue a
+			// seq. seq is a per-node counter shared across SKUs, so this mark
+			// is per-node too, not per (sku, node).
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO seq_watermark (node_id, seq) VALUES (?, ?)
+				 ON CONFLICT (node_id) DO UPDATE SET seq = MAX(seq, excluded.seq)`,
+				string(node), int64(seq)); err != nil {
+				return fmt.Errorf("raise watermark for %q: %w", node, err)
 			}
 			if _, err := tx.ExecContext(ctx,
 				`DELETE FROM events WHERE sku = ? AND node_id = ? AND seq <= ?`,

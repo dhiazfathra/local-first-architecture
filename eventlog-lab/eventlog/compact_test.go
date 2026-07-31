@@ -1,54 +1,58 @@
 package eventlog
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 )
 
 func TestCompactRequiresBothDominanceAndSnapshotCoverage(t *testing.T) {
 	ctx := context.Background()
 
+	all := []EventID{{"A", 1}, {"A", 2}, {"B", 1}}
+
 	tests := []struct {
-		name         string
-		snapshotFor  string // "" means save no snapshot
-		snapshotVV   VersionVector
-		upTo         VersionVector
-		wantRemainVV VersionVector
+		name        string
+		snapshotFor string // "" means save no snapshot
+		snapshotVV  VersionVector
+		upTo        VersionVector
+		wantRemain  []EventID
 	}{
 		{
-			name:         "no snapshot deletes nothing",
-			upTo:         VersionVector{"A": 2, "B": 1},
-			wantRemainVV: VersionVector{"A": 2, "B": 1},
+			name:       "no snapshot deletes nothing",
+			upTo:       VersionVector{"A": 2, "B": 1},
+			wantRemain: all,
 		},
 		{
-			name:         "snapshot covers all and peers acked all deletes all",
-			snapshotFor:  "SKU-1",
-			snapshotVV:   VersionVector{"A": 2, "B": 1},
-			upTo:         VersionVector{"A": 2, "B": 1},
-			wantRemainVV: VersionVector{},
+			name:        "snapshot covers all and peers acked all deletes all",
+			snapshotFor: "SKU-1",
+			snapshotVV:  VersionVector{"A": 2, "B": 1},
+			upTo:        VersionVector{"A": 2, "B": 1},
+			wantRemain:  nil,
 		},
 		{
-			name:         "peer behind keeps its uncovered events",
-			snapshotFor:  "SKU-1",
-			snapshotVV:   VersionVector{"A": 2, "B": 1},
-			upTo:         VersionVector{"A": 1, "B": 1},
-			wantRemainVV: VersionVector{"A": 2},
+			name:        "peer behind keeps its uncovered events",
+			snapshotFor: "SKU-1",
+			snapshotVV:  VersionVector{"A": 2, "B": 1},
+			upTo:        VersionVector{"A": 1, "B": 1},
+			wantRemain:  []EventID{{"A", 1}, {"A", 2}},
 		},
 		{
-			name:         "snapshot behind keeps events it does not fold in",
-			snapshotFor:  "SKU-1",
-			snapshotVV:   VersionVector{"A": 1},
-			upTo:         VersionVector{"A": 2, "B": 1},
-			wantRemainVV: VersionVector{"A": 2, "B": 1},
+			name:        "snapshot behind keeps events it does not fold in",
+			snapshotFor: "SKU-1",
+			snapshotVV:  VersionVector{"A": 1},
+			upTo:        VersionVector{"A": 2, "B": 1},
+			wantRemain:  all,
 		},
 		{
-			name:         "empty upTo deletes nothing",
-			snapshotFor:  "SKU-1",
-			snapshotVV:   VersionVector{"A": 2, "B": 1},
-			upTo:         VersionVector{},
-			wantRemainVV: VersionVector{"A": 2, "B": 1},
+			name:        "empty upTo deletes nothing",
+			snapshotFor: "SKU-1",
+			snapshotVV:  VersionVector{"A": 2, "B": 1},
+			upTo:        VersionVector{},
+			wantRemain:  all,
 		},
 	}
 
@@ -72,17 +76,29 @@ func TestCompactRequiresBothDominanceAndSnapshotCoverage(t *testing.T) {
 			if err := l.Compact(ctx, tt.upTo); err != nil {
 				t.Fatalf("Compact() error = %v", err)
 			}
+
+			var remain []EventID
+			for e, err := range l.Since(ctx, VersionVector{}) {
+				if err != nil {
+					t.Fatalf("Since() error = %v", err)
+				}
+				remain = append(remain, e.ID)
+			}
+			slices.SortFunc(remain, func(a, b EventID) int {
+				return cmp.Or(cmp.Compare(a.NodeID, b.NodeID), cmp.Compare(a.Seq, b.Seq))
+			})
+			if !slices.Equal(remain, tt.wantRemain) {
+				t.Fatalf("remaining rows = %v, want %v", remain, tt.wantRemain)
+			}
+
+			// Compaction never means "this event stopped happening": whatever
+			// it deleted, the version vector must still report it as held.
 			got, err := l.VersionVector(ctx)
 			if err != nil {
 				t.Fatalf("VersionVector() error = %v", err)
 			}
-			if len(got) != len(tt.wantRemainVV) {
-				t.Fatalf("remaining vv = %v, want %v", got, tt.wantRemainVV)
-			}
-			for k, v := range tt.wantRemainVV {
-				if got[k] != v {
-					t.Fatalf("remaining vv = %v, want %v", got, tt.wantRemainVV)
-				}
+			if got["A"] != 2 || got["B"] != 1 || len(got) != 2 {
+				t.Fatalf("vv after compaction = %v, want map[A:2 B:1]", got)
 			}
 		})
 	}
@@ -212,4 +228,54 @@ func TestCompactSurfacesDeleteError(t *testing.T) {
 	if err := l.Compact(ctx, VersionVector{"A": 1}); err == nil {
 		t.Fatal("Compact() with a delete-rejecting trigger error = nil, want an error")
 	}
+}
+
+// appendLocalSeqAfterCompact drives the exact regression: mint four local
+// events, snapshot+compact them all away, then mint one more. Before the
+// seq_watermark fix the fifth event was minted as A:1 -- a seq the node had
+// already emitted and every peer already held, so its own snapshot's covers
+// vector made the read path skip it and every peer's idempotent Append
+// dropped it. The event vanished with no error anywhere.
+func appendLocalSeqAfterCompact(ctx context.Context, t *testing.T, l Log) {
+	t.Helper()
+	mint := func(wall int64) func(Seq) Event {
+		return func(s Seq) Event { return qty("A", s, wall, "SKU-1", 1) }
+	}
+	for i := int64(1); i <= 4; i++ {
+		if _, err := l.AppendLocal(ctx, mint(100*i)); err != nil {
+			t.Fatalf("AppendLocal() error = %v", err)
+		}
+	}
+	if err := l.SaveSnapshot(ctx, "SKU-1", []byte(`{}`), VersionVector{"A": 4}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	if err := l.Compact(ctx, VersionVector{"A": 4}); err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+	// Nothing survives, yet the vector must still report the node's real past.
+	vv, err := l.VersionVector(ctx)
+	if err != nil {
+		t.Fatalf("VersionVector() error = %v", err)
+	}
+	if vv["A"] != 4 {
+		t.Fatalf("VersionVector() after compaction = %v, want A:4", vv)
+	}
+
+	e, err := l.AppendLocal(ctx, mint(500))
+	if err != nil {
+		t.Fatalf("AppendLocal() after compaction error = %v", err)
+	}
+	if e.ID.Seq != 5 {
+		t.Fatalf("AppendLocal() after compaction seq = %d, want 5 (a reused seq is a silently lost event)", e.ID.Seq)
+	}
+	if vv, err = l.VersionVector(ctx); err != nil {
+		t.Fatalf("VersionVector() error = %v", err)
+	}
+	if vv["A"] != 5 {
+		t.Fatalf("VersionVector() = %v, want A:5", vv)
+	}
+}
+
+func TestAppendLocalDoesNotReuseSeqAfterCompact(t *testing.T) {
+	appendLocalSeqAfterCompact(context.Background(), t, newTestLog(t))
 }

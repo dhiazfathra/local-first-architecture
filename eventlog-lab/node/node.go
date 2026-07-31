@@ -40,12 +40,46 @@ func New(cfg Config) (*Node, error) {
 	if cfg.Log == nil {
 		return nil, errors.New("node: nil log")
 	}
-	return &Node{
+	n := &Node{
 		id:        cfg.ID,
 		log:       cfg.Log,
 		clk:       clock.New(cfg.ID, cfg.Wall),
 		projector: &crdt.Projector{Log: cfg.Log, SnapshotEvery: cfg.SnapshotEvery},
-	}, nil
+	}
+	if err := n.recoverClock(context.Background()); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+// recoverClock seeds the HLC from the log's highest stamp. Every `lab op`
+// invocation is a fresh process, and a fresh Clock trusts only the wall
+// reading -- so a wall clock that has been skewed or jumped backwards since
+// this node last wrote (exactly what the ClockSkew fault simulates) would let
+// a restarted node emit a stamp sorting BEFORE its own earlier events. LWW
+// then silently rejects every metadata write it makes until wall time catches
+// up. Observing the stored maximum once, before the node is used, removes
+// that window.
+//
+// ponytail: full scan of the log, no new Log method or index -- Since already
+// orders by HLC and both backends implement it. If startup ever shows up in a
+// profile, add a `SELECT MAX(hlc_wall), ...` to the interface.
+func (n *Node) recoverClock(ctx context.Context) error {
+	var maxHLC clock.HLC
+	for e, err := range n.log.Since(ctx, eventlog.VersionVector{}) {
+		if err != nil {
+			return fmt.Errorf("node %q: recover clock: %w", n.id, err)
+		}
+		if maxHLC.Before(e.HLC) {
+			maxHLC = e.HLC
+		}
+	}
+	// Empty log: nothing to recover, and Observing the zero value would
+	// wrongly pin NodeID-less state into the clock.
+	if maxHLC != (clock.HLC{}) {
+		n.clk.Observe(maxHLC)
+	}
+	return nil
 }
 
 // ID reports this replica's identity.

@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS sync_cursors (
   peer_node_id TEXT NOT NULL PRIMARY KEY,
   last_seq     INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS seq_watermark (
+  node_id TEXT    NOT NULL PRIMARY KEY,
+  seq     INTEGER NOT NULL
+);
 `
 
 const selectEvents = `SELECT node_id, seq, hlc_wall, hlc_logical, sku, kind, payload FROM events`
@@ -104,12 +109,28 @@ const selectEvents = `SELECT node_id, seq, hlc_wall, hlc_logical, sku, kind, pay
 // yet -- both ROW_NUMBER() OVER and this style of "gaps and islands" query
 // work identically in SQLite (3.25+, already required for iter.Seq2) and
 // Postgres, so this text is shared verbatim by both backends.
+//
+// The run does not start at seq 1 once compaction has run: seq_watermark
+// records the highest seq ever deleted for a node, and those events really
+// happened -- compaction only means "a snapshot folds this in", never "this
+// event stopped existing". So the watermark is both a floor on the reported
+// frontier and the offset the contiguous run resumes from, and surviving rows
+// at or below it are ignored (they are already implied as held).
 const versionVectorQuery = `
-SELECT node_id, MAX(seq) AS frontier
+SELECT node_id, MAX(frontier) AS frontier
 FROM (
-  SELECT node_id, seq,
-         seq - ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY seq) AS grp
-  FROM events
-) contiguous
-WHERE grp = 0
+  SELECT node_id, seq AS frontier FROM seq_watermark
+  UNION ALL
+  SELECT node_id, MAX(seq) AS frontier
+  FROM (
+    SELECT e.node_id AS node_id, e.seq AS seq,
+           e.seq - ROW_NUMBER() OVER (PARTITION BY e.node_id ORDER BY e.seq)
+                 - COALESCE(w.seq, 0) AS grp
+    FROM events e
+    LEFT JOIN seq_watermark w ON w.node_id = e.node_id
+    WHERE e.seq > COALESCE(w.seq, 0)
+  ) contiguous
+  WHERE grp = 0
+  GROUP BY node_id
+) merged
 GROUP BY node_id`

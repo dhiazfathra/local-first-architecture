@@ -61,8 +61,8 @@ Faults: `partition`, `asym`, `skew`, `dup`, `reorder`, `crash`, `slow`, `all`.
 Central-store tests need Postgres:
 
 ```bash
-docker run --rm -d -e POSTGRES_PASSWORD=pg -p 5432:5432 postgres:16
-export EVENTLOG_LAB_PG_DSN='postgres://postgres:pg@127.0.0.1:5432/postgres?sslmode=disable'
+docker run --rm -d -e POSTGRES_PASSWORD=pg -p 55432:5432 postgres:16
+export EVENTLOG_LAB_PG_DSN='postgres://postgres:pg@127.0.0.1:55432/postgres?sslmode=disable'
 ```
 
 They carry a `//go:build integration` tag, so they are not part of the default

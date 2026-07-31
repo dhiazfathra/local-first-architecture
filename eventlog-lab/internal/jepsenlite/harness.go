@@ -277,9 +277,12 @@ func (c *Cluster) CheckConvergence(ctx context.Context, skus []string) error {
 	return nil
 }
 
-// CheckNoLostEvent asserts property 2: every acknowledged event is present in
-// every replica's log. Only ops that returned a nil error are acknowledged --
-// per the spec, a failed local Append carries no guarantee.
+// CheckNoLostEvent asserts property 2: every acknowledged event is covered by
+// every replica's VersionVector. The vector, not the raw rows, is the correct
+// witness: compaction deliberately deletes rows a snapshot already folds in,
+// while the vector still reports them as held (it is floored by the durable
+// seq watermark). Only ops that returned a nil error are acknowledged -- per
+// the spec, a failed local Append carries no guarantee.
 func (c *Cluster) CheckNoLostEvent(ctx context.Context, acked []eventlog.EventID) error {
 	for _, id := range c.IDs {
 		vv, err := c.Nodes[id].VersionVector(ctx)

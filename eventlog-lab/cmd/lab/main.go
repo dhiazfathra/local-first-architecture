@@ -79,13 +79,17 @@ func openNode(id, db string) (*node.Node, *eventlog.SQLiteLog, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// node.New only fails on an empty ID or a nil Log, both already ruled
-	// out above, so its error is unreachable here.
-	n, _ := node.New(node.Config{ //nolint:errcheck
+	// ID and Log are already validated above; New can still fail while
+	// recovering the HLC from an unreadable log, so propagate.
+	n, err := node.New(node.Config{
 		ID:            clock.NodeID(id),
 		Log:           l,
 		SnapshotEvery: 64,
 	})
+	if err != nil {
+		_ = l.Close()
+		return nil, nil, err
+	}
 	return n, l, nil
 }
 

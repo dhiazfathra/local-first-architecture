@@ -66,6 +66,10 @@ func (p *Projector) MaybeSnapshot(ctx context.Context, sku string) error {
 		return nil
 	}
 
+	// ponytail: re-folds the SKU's whole history on every trigger, so
+	// snapshotting a SKU is O(n^2) over its lifetime. Performance is an
+	// explicit non-goal here; if this ever shows up in a profile, fold from
+	// the existing snapshot forward instead of from identity.
 	state := NewItemState()
 	covers := eventlog.VersionVector{}
 	for e, err := range p.Log.EventsForSKU(ctx, sku, eventlog.VersionVector{}) {
