@@ -35,9 +35,28 @@ deliveries, and crashes nodes mid-append, then asserts:
 ## Running
 
 ```bash
-go test ./... -cover          # unit and property tests
-go run ./cmd/lab sim --seed 42 --nodes 3 --ops 500 --faults partition,skew,dup
+go test ./... -cover          # unit, property, and harness tests
 ```
+
+### CLI
+
+```bash
+# Serve replication and sync with central every 5s.
+lab node --id A --db a.db --central localhost:9000 --listen :9001
+
+# Local ops. These never touch the network -- a node is fully usable offline.
+lab op --id A --db a.db receive SKU-1 10
+lab op --id A --db a.db pick    SKU-1 3
+
+# Merged state of one SKU.
+lab state --id A --db a.db SKU-1
+
+# The harness, from the command line. Prints a convergence report; exits
+# non-zero with a reproducing seed if any property is violated.
+lab sim --seed 42 --nodes 3 --ops 500 --faults partition,skew,dup
+```
+
+Faults: `partition`, `asym`, `skew`, `dup`, `reorder`, `crash`, `slow`, `all`.
 
 Central-store tests need Postgres:
 
