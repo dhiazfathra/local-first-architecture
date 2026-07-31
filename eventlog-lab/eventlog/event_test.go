@@ -96,6 +96,8 @@ func TestEventValidate(t *testing.T) {
 		{"meta kind with empty meta", base(func(e *Event) { e.Kind = KindMetaSet; e.Delta = 0; e.Meta = &MetaSet{} }), true},
 		{"delete kind without value", base(func(e *Event) { e.Kind = KindDeleteSet; e.Delta = 0 }), true},
 		{"delta set on meta kind", base(func(e *Event) { e.Kind = KindMetaSet; e.Meta = &MetaSet{Name: ptr("W")} }), true},
+		{"meta set on delta kind", base(func(e *Event) { e.Meta = &MetaSet{Name: ptr("W")} }), true},
+		{"deletedTo set on delta kind", base(func(e *Event) { e.DeletedTo = ptr(true) }), true},
 		{"hlc node mismatch", base(func(e *Event) { e.HLC.NodeID = "B" }), true},
 	}
 	for _, tt := range tests {

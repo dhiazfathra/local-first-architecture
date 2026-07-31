@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
 )
@@ -76,11 +75,7 @@ type payload struct {
 
 // MarshalPayload encodes the kind-specific fields.
 func (e Event) MarshalPayload() ([]byte, error) {
-	b, err := json.Marshal(payload{Delta: e.Delta, Meta: e.Meta, DeletedTo: e.DeletedTo})
-	if err != nil {
-		return nil, fmt.Errorf("marshal payload for %v: %w", e.ID, err)
-	}
-	return b, nil
+	return json.Marshal(payload{Delta: e.Delta, Meta: e.Meta, DeletedTo: e.DeletedTo})
 }
 
 // UnmarshalPayload decodes the kind-specific fields into e.
@@ -125,9 +120,6 @@ func (e Event) Validate() error {
 	case KindQuantityDelta:
 		if e.Delta == 0 {
 			return fmt.Errorf("%w: zero quantity delta", ErrMalformedEvent)
-		}
-		if e.Delta == math.MinInt64 {
-			return fmt.Errorf("%w: delta %d has no representable magnitude", ErrMalformedEvent, e.Delta)
 		}
 	case KindMetaSet:
 		if e.Meta.Empty() {
