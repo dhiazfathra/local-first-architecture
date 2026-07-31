@@ -94,3 +94,29 @@ func TestGRPCStreamCloseSendSurfacesConnCloseError(t *testing.T) {
 		t.Fatal("CloseSend() error = nil, want the already-closed connection to surface")
 	}
 }
+
+// TestGRPCStreamCloseSendSurfacesDrainError cancels the stream's context right
+// after dialing, so CloseSend's own half-close succeeds but the drain loop's
+// Recv (waiting for the server to finish) hits a non-EOF error, which must
+// surface rather than be swallowed.
+func TestGRPCStreamCloseSendSurfacesDrainError(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	gs := grpc.NewServer()
+	Register(gs, NewServer(newNode(t, "B"), 4))
+	go func() { _ = gs.Serve(lis) }()
+	t.Cleanup(gs.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dialer := NewGRPCDialer(grpc.WithTransportCredentials(insecure.NewCredentials()))
+	st, err := dialer.Dial(ctx, lis.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	cancel()
+	if err := st.CloseSend(); err == nil {
+		t.Fatal("CloseSend() error = nil, want the canceled context to surface from the drain")
+	}
+}

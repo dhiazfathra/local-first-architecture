@@ -2,7 +2,9 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 
 	"google.golang.org/grpc"
 
@@ -38,11 +40,20 @@ type grpcStream struct {
 }
 
 func (s *grpcStream) CloseSend() error {
-	err := s.Sync_ReplicateClient.CloseSend()
-	if cerr := s.conn.Close(); err == nil && cerr != nil {
-		err = cerr
+	sendErr := s.Sync_ReplicateClient.CloseSend()
+	// Half-closing the send side does not mean the server has received or
+	// applied anything already in flight -- over a real connection those
+	// frames can still be buffered. By protocol the server ends the session
+	// right after our Ack, so one more Recv either confirms that (io.EOF) or
+	// surfaces why it didn't. Only after that is it safe to tear down the
+	// conn: closing it first can race the server's in-flight merge and
+	// silently drop it.
+	var drainErr error
+	if _, recvErr := s.Recv(); recvErr != nil && !errors.Is(recvErr, io.EOF) {
+		drainErr = recvErr
 	}
-	if err != nil {
+	closeErr := s.conn.Close()
+	if err := errors.Join(sendErr, drainErr, closeErr); err != nil {
 		return fmt.Errorf("grpc close send: %w", err)
 	}
 	return nil
