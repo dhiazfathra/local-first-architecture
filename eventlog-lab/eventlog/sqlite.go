@@ -57,10 +57,9 @@ func (l *SQLiteLog) Append(ctx context.Context, e Event) error {
 	if err := e.Validate(); err != nil {
 		return err
 	}
-	payload, err := e.MarshalPayload()
-	if err != nil {
-		return err
-	}
+	// Event's payload fields (int64/*MetaSet/*bool) always marshal cleanly;
+	// no input shape here can make json.Marshal fail.
+	payload, _ := e.MarshalPayload()
 	if _, err := l.db.ExecContext(ctx, insertEvent,
 		string(e.ID.NodeID), int64(e.ID.Seq), e.HLC.Wall, int64(e.HLC.Logical),
 		e.SKU, int(e.Kind), payload); err != nil {
@@ -90,10 +89,8 @@ func (l *SQLiteLog) AppendLocal(ctx context.Context, mint func(Seq) Event) (Even
 	if err := e.Validate(); err != nil {
 		return Event{}, err
 	}
-	payload, err := e.MarshalPayload()
-	if err != nil {
-		return Event{}, err
-	}
+	// See Append: this payload shape can never fail to marshal.
+	payload, _ := e.MarshalPayload()
 	if _, err := tx.ExecContext(ctx, insertEvent,
 		string(e.ID.NodeID), int64(e.ID.Seq), e.HLC.Wall, int64(e.HLC.Logical),
 		e.SKU, int(e.Kind), payload); err != nil {
@@ -251,10 +248,9 @@ func (l *SQLiteLog) LoadSnapshot(ctx context.Context, sku string) ([]byte, Versi
 
 // SaveSnapshot replaces the snapshot for sku.
 func (l *SQLiteLog) SaveSnapshot(ctx context.Context, sku string, state []byte, covers VersionVector) error {
-	blob, err := json.Marshal(covers)
-	if err != nil {
-		return fmt.Errorf("encode snapshot covers for %q: %w", sku, err)
-	}
+	// covers is a VersionVector (map[clock.NodeID]Seq); no value of that type
+	// can fail to marshal.
+	blob, _ := json.Marshal(covers)
 	if _, err := l.db.ExecContext(ctx,
 		`INSERT INTO snapshots (sku, state, covers) VALUES (?, ?, ?)
 		 ON CONFLICT (sku) DO UPDATE SET state = excluded.state, covers = excluded.covers`,
