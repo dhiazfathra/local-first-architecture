@@ -56,6 +56,7 @@ func (m *MemoryTransport) Dial(ctx context.Context, addr string) (Stream, error)
 	}
 
 	p := &memPipe{
+		ctx:      ctx,
 		toServer: make(chan *syncpb.ClientFrame, 1024),
 		toClient: make(chan *syncpb.ServerFrame, 1024),
 		done:     make(chan struct{}),
@@ -72,6 +73,7 @@ func (m *MemoryTransport) Dial(ctx context.Context, addr string) (Stream, error)
 
 // memPipe is a bidirectional in-memory frame pipe.
 type memPipe struct {
+	ctx       context.Context
 	toServer  chan *syncpb.ClientFrame
 	toClient  chan *syncpb.ServerFrame
 	done      chan struct{}
@@ -105,6 +107,8 @@ func (s *memClientSide) Send(f *syncpb.ClientFrame) error {
 		case p.toServer <- cf:
 		case <-p.done:
 			return errors.New("memory transport: session ended")
+		case <-p.ctx.Done():
+			return fmt.Errorf("memory transport: %w", p.ctx.Err())
 		}
 	}
 	return nil
@@ -112,14 +116,21 @@ func (s *memClientSide) Send(f *syncpb.ClientFrame) error {
 
 func (s *memClientSide) Recv() (*syncpb.ServerFrame, error) {
 	p := (*memPipe)(s)
-	f, ok := <-p.toClient
-	if !ok {
-		if p.serverErr != nil {
-			return nil, fmt.Errorf("memory transport: server session failed: %w", p.serverErr)
+	select {
+	case f, ok := <-p.toClient:
+		if !ok {
+			if p.serverErr != nil {
+				return nil, fmt.Errorf("memory transport: server session failed: %w", p.serverErr)
+			}
+			return nil, io.EOF
 		}
-		return nil, io.EOF
+		return f, nil
+	case <-p.ctx.Done():
+		// A dropped frame (a partition) never arrives on either channel, so
+		// without this the session blocks forever instead of failing: the
+		// caller must bound ctx for a partition to actually break the stream.
+		return nil, fmt.Errorf("memory transport: %w", p.ctx.Err())
 	}
-	return f, nil
 }
 
 func (s *memClientSide) CloseSend() error {
@@ -134,11 +145,16 @@ func (s *memClientSide) CloseSend() error {
 type memServerSide memPipe
 
 func (s *memServerSide) Recv() (*syncpb.ClientFrame, error) {
-	f, ok := <-(*memPipe)(s).toServer
-	if !ok {
-		return nil, io.EOF
+	p := (*memPipe)(s)
+	select {
+	case f, ok := <-p.toServer:
+		if !ok {
+			return nil, io.EOF
+		}
+		return f, nil
+	case <-p.ctx.Done():
+		return nil, fmt.Errorf("memory transport: %w", p.ctx.Err())
 	}
-	return f, nil
 }
 
 func (s *memServerSide) Send(f *syncpb.ServerFrame) error {
@@ -148,7 +164,11 @@ func (s *memServerSide) Send(f *syncpb.ServerFrame) error {
 		if !ok {
 			return fmt.Errorf("memory transport: filter returned %T on the server side", out)
 		}
-		p.toClient <- sf
+		select {
+		case p.toClient <- sf:
+		case <-p.ctx.Done():
+			return fmt.Errorf("memory transport: %w", p.ctx.Err())
+		}
 	}
 	return nil
 }
