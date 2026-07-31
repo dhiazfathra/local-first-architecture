@@ -104,6 +104,32 @@ func TestMaybeSnapshotHonoursThreshold(t *testing.T) {
 	}
 }
 
+// TestMaybeSnapshotClampsCoversToGapFreePrefix guards against the silent-loss
+// risk in which Compact durably raises a node's watermark off a gapped
+// covers vector: if node A's seq 2 was never delivered (reorder/async
+// faults), covers["A"] must clamp to 1, never jump to 3 on the strength of
+// seq 3 alone.
+func TestMaybeSnapshotClampsCoversToGapFreePrefix(t *testing.T) {
+	ctx := context.Background()
+	p, l := newProjector(t, 2)
+	if err := l.Append(ctx, qty("A", 1, 10, 10)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if err := l.Append(ctx, qty("A", 3, 30, 5)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if err := p.MaybeSnapshot(ctx, "SKU-1"); err != nil {
+		t.Fatalf("MaybeSnapshot() error = %v", err)
+	}
+	_, covers, err := l.LoadSnapshot(ctx, "SKU-1")
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if got := covers["A"]; got != 1 {
+		t.Fatalf("covers[%q] = %d, want 1 (gap-free prefix, seq 2 was never delivered)", "A", got)
+	}
+}
+
 func TestProjectRejectsCorruptSnapshotState(t *testing.T) {
 	ctx := context.Background()
 	p, l := newProjector(t, 0)
@@ -151,6 +177,31 @@ func TestMaybeSnapshotSurfacesEventsForSKUError(t *testing.T) {
 	p := &Projector{Log: eventsForSKUFailsLog{l}, SnapshotEvery: 1}
 	if err := p.MaybeSnapshot(ctx, "SKU-1"); err == nil {
 		t.Fatal("MaybeSnapshot() error = nil when EventsForSKU fails, want an error")
+	}
+}
+
+// versionVectorFailsLog wraps a real log but forces VersionVector to error,
+// exercising MaybeSnapshot's frontier-lookup error path (added when
+// MaybeSnapshot started consulting the log's true gap-free frontier to
+// decide what's safe to fold, rather than folding everything and clamping
+// covers after the fact).
+type versionVectorFailsLog struct {
+	*eventlog.SQLiteLog
+}
+
+func (versionVectorFailsLog) VersionVector(context.Context) (eventlog.VersionVector, error) {
+	return nil, errors.New("boom")
+}
+
+func TestMaybeSnapshotSurfacesVersionVectorError(t *testing.T) {
+	ctx := context.Background()
+	_, l := newProjector(t, 1)
+	if err := l.Append(ctx, qty("A", 1, 10, 1)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	p := &Projector{Log: versionVectorFailsLog{l}, SnapshotEvery: 1}
+	if err := p.MaybeSnapshot(ctx, "SKU-1"); err == nil {
+		t.Fatal("MaybeSnapshot() error = nil when VersionVector fails, want an error")
 	}
 }
 

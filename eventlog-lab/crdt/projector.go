@@ -70,11 +70,33 @@ func (p *Projector) MaybeSnapshot(ctx context.Context, sku string) error {
 	// snapshotting a SKU is O(n^2) over its lifetime. Performance is an
 	// explicit non-goal here; if this ever shows up in a profile, fold from
 	// the existing snapshot forward instead of from identity.
+	// Seq is allocated per node across the whole log, not per SKU, so a gap
+	// in this SKU's own seq sequence is normal (another SKU's event used
+	// that number) and is NOT evidence of a missing event. The only source
+	// of truth for "is a node's frontier actually gap-free" is the full
+	// log's own contiguity check (the same one VersionVector uses): compute
+	// it BEFORE folding, and use it to decide what gets folded at all.
+	//
+	// A node's events past its frontier must be skipped here, not folded
+	// and then merely left out of covers: state.Apply is deliberately non-
+	// idempotent (see its doc comment), and Project's read path re-applies
+	// anything with seq > covers. Folding an event now but excluding it from
+	// covers would make Project fold it again later -- double-counting a
+	// quantity delta. Skipping it here instead defers it to that same
+	// ordinary incremental fold, exactly once, whenever its node's frontier
+	// catches up.
+	trueFrontier, err := p.Log.VersionVector(ctx)
+	if err != nil {
+		return fmt.Errorf("snapshot %q: %w", sku, err)
+	}
 	state := NewItemState()
 	covers := eventlog.VersionVector{}
 	for e, err := range p.Log.EventsForSKU(ctx, sku, eventlog.VersionVector{}) {
 		if err != nil {
 			return fmt.Errorf("snapshot %q: %w", sku, err)
+		}
+		if e.ID.Seq > trueFrontier[e.ID.NodeID] {
+			continue
 		}
 		state.Apply(e)
 		covers.Observe(e.ID)
