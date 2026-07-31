@@ -5139,6 +5139,52 @@ func TestApplyIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestApplyRecoversWithoutDoubleCountingAfterATransientFailure proves the
+// property Service.apply's projections-first ordering depends on: a failed
+// Apply must not record the event as applied, and a retry after the fault
+// clears must fold the event in exactly once, never twice.
+func TestApplyRecoversWithoutDoubleCountingAfterATransientFailure(t *testing.T) {
+	l, set := openSet(t)
+	envs, err := l.Emit([]domain.Event{received("WIDGET", "L1", "RECV-01", 10)}, nil)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	// Simulate a transient projection failure — e.g. a brief connection blip or
+	// concurrent migration — by removing the table Apply writes to.
+	if _, err := l.DB().Exec(`DROP TABLE stock_on_hand`); err != nil {
+		t.Fatalf("drop stock_on_hand: %v", err)
+	}
+	if err := set.Apply(envs[0]); err == nil {
+		t.Fatal("Apply succeeded despite the missing stock table")
+	}
+	applied, err := set.IsApplied(envs[0].ID)
+	if err != nil {
+		t.Fatalf("IsApplied: %v", err)
+	}
+	if applied {
+		t.Fatal("IsApplied is true after a failed Apply — the rolled-back transaction must not have recorded it")
+	}
+
+	// The fault clears, exactly as a real transient failure resolves on its own.
+	if _, err := l.DB().Exec(`CREATE TABLE stock_on_hand (
+		sku TEXT NOT NULL, location TEXT NOT NULL, lot_id TEXT NOT NULL, qty REAL NOT NULL,
+		PRIMARY KEY (sku, location, lot_id))`); err != nil {
+		t.Fatalf("recreate stock_on_hand: %v", err)
+	}
+	if err := set.Apply(envs[0]); err != nil {
+		t.Fatalf("Apply after the fault cleared: %v", err)
+	}
+
+	got, err := set.Balance(domain.StockKey{SKU: "WIDGET", Location: "RECV-01", LotID: "L1"})
+	if err != nil {
+		t.Fatalf("Balance: %v", err)
+	}
+	if got != 10 {
+		t.Fatalf("balance = %v, want exactly 10 — a retry after a failed Apply must not double-apply", got)
+	}
+}
+
 func TestCatchUpFoldsEventsAppliedBehindOurBack(t *testing.T) {
 	l, set := openSet(t)
 	// Written straight to the log, as the sync client does when ingesting from
@@ -6909,12 +6955,12 @@ func Open(path string, id domain.NodeID, now func() time.Time) (*Service, error)
 
 // rebuildState replays the entire log into a fresh in-memory domain.State. Unlike
 // the projections, state has no durable per-event applied marker of its own — it is
-// an in-memory derivation, so the only way to guarantee it matches the log after any
-// partial failure is to throw it away and replay from scratch. Open uses this to
-// build state the first time; apply uses it to recover state if projection
-// application fails after state application already ran, so a log event that is
-// persisted always ends up correctly reflected once the failure is retried, instead
-// of leaving the projections permanently behind the log.
+// an in-memory derivation, so the only way to guarantee it matches the log is to
+// derive it wholesale rather than mutate it incrementally. Open uses this to build
+// state the first time; apply calls it every time projections successfully catch up,
+// so state is always a fresh, idempotent replay of exactly what the log and the
+// projections' applied markers agree has happened — never state.Apply(env) run
+// against a state that might already reflect env from an earlier partial retry.
 func (s *Service) rebuildState() error {
 	envs, err := s.log.ReadAll()
 	if err != nil {
@@ -6964,13 +7010,15 @@ func (s *Service) Execute(cmd Command) ([]domain.Envelope, error) {
 // how many were new. There is no validation: a node cannot refuse a compensation,
 // which is what makes central authoritative.
 //
-// Which envelopes still need applying is decided by asking the projections, which
-// carry a durable per-event applied marker (Task 11), not by comparing against a
-// version vector captured before the insert. A version-vector comparison only tells
-// you what the log gained in *this* call — if a previous call persisted an event but
-// crashed or errored before applying it, that event is already reflected in the log's
-// version vector on the next call and would never be recognised as still-pending.
-// Asking the projections directly is what gives ingestion a recovery path.
+// Ingest does not pre-filter which envelopes still need applying — apply itself
+// asks the projections' durable per-event applied marker (Task 11) for each one
+// and skips what is already there, so passing the full batch on every retry is
+// safe. This is deliberately not a version-vector comparison: a version vector
+// only tells you what the log gained in *this* call, and if a previous call
+// persisted an event but crashed or errored before applying it, that event is
+// already reflected in the log's version vector on the next call and would never
+// be recognised as still-pending. Asking the projections directly, inside apply,
+// is what gives ingestion a recovery path.
 func (s *Service) Ingest(envs []domain.Envelope) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -6979,17 +7027,7 @@ func (s *Service) Ingest(envs []domain.Envelope) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	var fresh []domain.Envelope
-	for _, env := range envs {
-		applied, err := s.set.IsApplied(env.ID)
-		if err != nil {
-			return n, err
-		}
-		if !applied {
-			fresh = append(fresh, env)
-		}
-	}
-	return n, s.apply(fresh)
+	return n, s.apply(envs)
 }
 
 // RegisterLocation declares a node-owned stock location. Locations are node-owned —
@@ -7006,29 +7044,43 @@ func (s *Service) RegisterLocation(code domain.LocationCode, typ domain.Location
 	return err
 }
 
-// apply folds envelopes into the in-memory state and the projections. State is
-// applied first because it is in memory and cannot fail partway in a way the
-// projections could observe.
+// apply folds envelopes into the projections, then rebuilds state from the log.
 //
-// If projection application fails after state has already absorbed the same event,
-// state and the (durably marker-tracked) projections would otherwise disagree about
-// what has been applied, and the caller's retry — which recomputes "fresh" from the
-// projections' applied marker — would replay that event into state a second time.
-// Rebuilding state from the log on any failure here throws away the untracked
-// in-memory partial progress and guarantees state matches exactly what the
-// projections (and a subsequent retry) believe has been applied.
+// Projections come first because they carry a durable per-event applied marker
+// (Task 11): applying the same envelope to them twice is a safe no-op, so a retry
+// that re-submits an envelope already reflected in the projections is harmless.
+// State has no such marker — it is a plain in-memory struct — so it is never
+// mutated incrementally here. Instead, once every envelope in this call has
+// cleared the projections, state is rebuilt wholesale from the persisted log via
+// rebuildState, which is itself idempotent: replaying the same log twice always
+// produces the same state.
+//
+// This ordering is what rules out double-applying a non-idempotent effect (a
+// stock movement) after a partial failure. Consider the alternative this replaced:
+// apply state first, then projections, and rebuild state from the log only when
+// projections fail. If state.Apply(env) succeeds but set.Apply(env) then fails,
+// rebuildState makes state correct again (the log already has env, so the replay
+// includes it) — but the projections' applied marker for env is still unset. A
+// retry recomputes "still needs applying" from that marker, sees env as pending
+// again, and calls apply([env]) a second time: state.Apply(env) now runs against
+// a state that already reflects env via the earlier rebuild, applying it twice.
+// Doing projections first and always deriving state by full rebuild removes the
+// possibility entirely: state is never asked to apply an envelope it might
+// already contain, because it is never asked to apply envelopes one at a time.
 func (s *Service) apply(envs []domain.Envelope) error {
 	for _, env := range envs {
-		if err := s.state.Apply(env); err != nil {
-			_ = s.rebuildState()
+		applied, err := s.set.IsApplied(env.ID)
+		if err != nil {
 			return err
 		}
+		if applied {
+			continue
+		}
 		if err := s.set.Apply(env); err != nil {
-			_ = s.rebuildState()
 			return err
 		}
 	}
-	return nil
+	return s.rebuildState()
 }
 
 // StockOnHand returns operator-visible balances. Empty arguments mean "no filter".
