@@ -11,7 +11,7 @@ Build a local-first inventory node whose source of truth is a local append-only 
 Success criterion: a property-based harness that partitions nodes, skews clocks, duplicates and reorders deliveries, and crashes nodes mid-append, and still asserts:
 
 1. **Convergence** — all nodes that have exchanged the same event set compute identical state.
-2. **No lost event** — every event durably acknowledged to a caller appears in every replica's log after sync.
+2. **No lost event** — every event durably acknowledged to a caller is reflected in every replica's *projected state* after sync — i.e. it was applied at least once on every replica before any snapshot/compaction was allowed to discard it. This is a replay-equivalent-state guarantee, not a promise that the raw event row survives forever: `Compact` may delete an event's row once every peer has acked past it and a local snapshot already folds it in (see Snapshots and compaction). Losing the row after that point does not lose the event's effect.
 3. **Order independence** — replaying a node's merged log in any causally-valid order yields identical state.
 
 ## Non-Goals
@@ -45,7 +45,7 @@ type Event struct {
 }
 ```
 
-`KindQuantityDelta` carries a signed delta, not an absolute value — this is what makes quantity commutative.
+`KindQuantityDelta` carries a signed delta, not an absolute value — this is what makes quantity commutative. `Delta` is `int64`; `Delta == math.MinInt64` is rejected by `Event.Validate` because `-Delta` (needed to store its magnitude in the PN-counter's `Neg` half) is not representable as a positive `int64`. Everything in `[math.MinInt64+1, math.MaxInt64]` is accepted at the event level; see `crdt/` below for the corresponding running-total overflow bound.
 
 ## Architecture
 
@@ -90,14 +90,21 @@ CREATE INDEX events_by_sku ON events (sku);
 CREATE TABLE snapshots (
   sku        TEXT    NOT NULL PRIMARY KEY,
   state      BLOB    NOT NULL,   -- serialized CRDT state incl. per-node counters
-  covers     BLOB    NOT NULL    -- version vector this snapshot folds in
+  covers     BLOB    NOT NULL    -- version vector restricted to nodes that have
+                                 -- contributed an event for THIS sku (see below)
 );
 
 CREATE TABLE sync_cursors (
-  peer_node_id TEXT NOT NULL PRIMARY KEY,
-  last_seq     INTEGER NOT NULL  -- highest seq of theirs we have applied
+  peer_node_id TEXT    NOT NULL PRIMARY KEY,
+  last_seq     INTEGER NOT NULL  -- diagnostic only, see below: peer's own
+                                 -- highest seq we last saw it ack, NOT the
+                                 -- mechanism that decides what to sync
 );
 ```
+
+`last_seq` is intentionally a single scalar, not a full `VersionVector`: it exists only to detect and log a peer claiming to have regressed (`peerVV[peer] < last_seq`), by comparing against that same peer's own contribution to its own last-reported vector — a single number is exactly sufficient for that, one node compared with itself. It is **not** what decides which events to exchange in a session: every session re-exchanges each side's complete, freshly-computed `VersionVector` in `Hello`/`Welcome` (see `sync/` below), so a session's correctness never depends on this stored cursor being complete or current, and a merged log holding events relayed from many origins is already handled correctly by the fresh, full vector exchanged every time.
+
+**`VersionVector` reports a gap-free contiguous prefix per node, not a raw highest-seq.** The harness's `Reorder` fault permutes whole `Events` batches, and a single batch can carry events from more than one origin interleaved by HLC order, so two events from the same origin node can legitimately land in different batches that arrive out of order. If `VersionVector` reported a raw `MAX(seq)` per node, receiving that node's event 2 before its event 1 would report the node as "covered through 2" while event 1 was never actually received — any peer using `Contains`/`Dominates` against that vector to decide what this replica still needs would wrongly conclude event 1 is already here and never send it again, losing it permanently. Instead, `VersionVector` computes the highest seq in the gap-free run starting at 1 (a "gaps and islands" query); a gap simply holds the frontier back until the missing event arrives, which it eventually does, since `Reorder` delays frames rather than dropping them. The map shape (`map[NodeID]Seq`) and the `Contains`/`Dominates`/`Observe`/`Merge` operations are unchanged — only the query populating the map accounts for gaps, so no contiguous-prefix-plus-explicit-gap-list structure is needed.
 
 Interface:
 
@@ -125,11 +132,13 @@ type ItemState struct {
     Deleted      LWW[bool]
 }
 
-func (s *ItemState) Apply(e Event)   // must be commutative, associative, idempotent
+func (s *ItemState) Apply(e Event)   // must be commutative and associative; NOT idempotent on its own — see below
 func (s ItemState) Quantity() int64  // sum(Pos) - sum(Neg)
 ```
 
-`Apply` for `KindQuantityDelta` adds `|Delta|` into `Pos[e.ID.NodeID]` or `Neg[...]` — but a naive `+=` is **not idempotent** under duplicate delivery. Resolution: the PN-counter half is stored per-node as a running total, and `Apply` is only ever driven by the log's projection over a deduplicated event set. Idempotence is provided by `Append`'s primary key, not by `Apply`. This must be stated in code comments and asserted by a test that applies the same event twice via the log path and once via the direct path, and shows why only the log path is safe.
+`Apply` for `KindQuantityDelta` adds `|Delta|` into `Pos[e.ID.NodeID]` or `Neg[...]` — a naive `+=` is **not idempotent** under duplicate delivery: calling `Apply` twice with the same event double-counts. `Apply` itself never deduplicates and is not required to. The system's idempotence guarantee lives one layer up, at the log: `Append`'s primary key on `(NodeID, Seq)` guarantees an event is stored at most once, so `fold(Apply, events read back from the log)` sees each event exactly once regardless of how many times it was delivered or appended over the wire. Any caller that drives `Apply` directly from a stream that has *not* passed through `Append`-deduplicated storage (e.g. a raw event feed) is responsible for its own dedup — `Apply` will happily double-count otherwise. This must be stated in code comments and asserted by a test that (a) reads the same physical log twice into two fresh `ItemState`s and shows identical results, and (b) calls `Apply` twice directly with the same event on one `ItemState` and shows the count doubles, demonstrating why only the log path is safe.
+
+`Pos`/`Neg` running totals are `int64` and accumulate `|Delta|` per node over the node's entire lifetime. The one arithmetic operation that can actually overflow on a single event — negating `Delta` to store its magnitude — is closed off at the trust boundary: `Event.Validate` rejects `Delta == math.MinInt64`, the only `int64` value whose negation doesn't fit back in `int64`. Cumulative overflow of `sum(Pos)` or `sum(Neg)` after an astronomical number of events is a known, accepted ceiling of using fixed-width `int64` totals for this toy domain — not a realistic operating condition (it needs more picks/receives than an `int64` counter can log in the first place) — and is intentionally not guarded with `big.Int` or saturation logic; upgrade path if it ever matters: widen the counters or check `sum` in `Quantity()`.
 
 `LWW[T]` holds `{Value T; At HLC}`; `Set` accepts the new value only if `existing.At.Before(new.At)`. Total order on HLC means ties are impossible.
 
@@ -159,6 +168,8 @@ message ServerFrame {
 }
 ```
 
+**Known limitation — no protocol outcome for a permanently invalid batch.** A malformed/unparseable event (see Error handling) is rejected, logged, and the session continues, but the receiver's version vector never advances past it, so the sender's `Since` query includes it again on every future session: a persistently malformed event retries forever with no automatic resolution. This is an accepted gap, not an oversight — resolving it properly means either a wire-level rejection/quarantine frame or a durably persisted per-peer skip-list, and both are more machinery than this learning project's scope justifies for what should be a rare condition between compliant replicas (it indicates a genuine bug or version skew, not routine operation). The manual remediation path is to fix or remove the offending row at its origin node. Upgrade path if this ever needs to be automatic: add a `Reject{event_ids}` frame to the protocol (see `sync/sync.proto`) and a persisted skip-list the sender consults before resending.
+
 Protocol per session: exchange version vectors, each side streams what the other lacks, each side `Append`s and acks. No arbitration frames — central cannot reject, only merge. Resumable: cursors persist, so a dropped stream resumes from the last ack rather than restarting.
 
 Central store is a second `eventlog.Log` backed by Postgres with the same schema, plus a projection of merged `ItemState` per SKU for reporting. Central runs the identical `crdt.Apply` code — no second implementation.
@@ -169,7 +180,11 @@ Each node: local log + clock + projection cache + sync client. Exposes an in-pro
 
 ## Snapshots and compaction
 
-Projection is `fold(Apply, events for SKU)`. Snapshot after N events per SKU, recording the version vector it covers. Read path: load snapshot, apply only events not covered. `Compact` deletes events dominated by every peer's acked version vector **and** covered by a local snapshot — never events a peer has not yet seen.
+Projection is `fold(Apply, events for SKU)`. Snapshot after N events per SKU, recording the version vector it covers. Read path: load snapshot, apply only events not covered.
+
+`covers` is a `VersionVector` populated **only from the origin nodes that have actually written an event for this SKU** — it is not a slice of the node's global version vector, it is a distinct, smaller map built by observing each per-SKU event's `EventID` as it is folded. This is safe to compare against another node's *global* `VersionVector` (e.g. a peer's acked cursor) with the existing `Dominates`, because `Dominates` only inspects keys present in `covers`: since a node's `Seq` numbering is shared across all SKUs, `peerVV.Dominates(snapshot.covers)` is true exactly when the peer has received every event this SKU's snapshot folded in, with no separate per-SKU sequence space required.
+
+`Compact` deletes events dominated by every peer's acked version vector **and** covered by a local snapshot — never events a peer has not yet seen.
 
 Compaction correctness is a harness property: compact aggressively on one node, then have a stale peer sync, and assert convergence still holds.
 
@@ -185,7 +200,7 @@ Faults, each independently togglable and composable:
 | Asymmetric partition | drops one direction only |
 | Clock skew | per-node wall clock offset, including backwards jumps |
 | Duplicate delivery | transport re-sends a random prior frame |
-| Reorder | transport buffers and permutes frames within a window |
+| Reorder | transport buffers and permutes frames within a window, including frames carrying different sequence numbers from the same origin node (see the `VersionVector` gap-handling note above, which is what makes this safe) |
 | Crash mid-append | log wrapper aborts the transaction, then reopens the DB |
 | Slow peer | delays acks past the next batch |
 
@@ -195,14 +210,14 @@ Additional targeted tests, not left to random search:
 
 - `Apply` commutativity: for a fixed event set, every permutation yields the same `ItemState` (exhaustive for small sets, sampled above that).
 - HLC monotonicity under backwards wall-clock jumps.
-- Idempotence: replay a full log twice, state unchanged.
+- Idempotence-via-log: reading the same log twice into two fresh `ItemState`s (the only supported replay path) yields identical state; a separate test calls `Apply` twice directly on one `ItemState` with the same event and shows the count doubles, documenting that `Apply` itself is not idempotent — only `Append`'s primary key makes the end-to-end system idempotent.
 - Concurrent decrement below zero: two nodes each pick 8 of 10 units. Quantity converges to −6 on every replica. **This is correct CRDT behavior and the spec accepts it** — negative stock is a reportable anomaly at central, not a rejected write. Documenting this limitation honestly is the point; `warehouse-node` is where rejection lives.
 
 100% coverage target per the repo standard, with the harness counted as tests, not as covered code.
 
 ## CLI (`cmd/lab/`)
 
-```
+```text
 lab node --id A --db a.db --central localhost:9000
 lab op   --id A receive SKU-1 10
 lab op   --id A pick    SKU-1 3
@@ -216,7 +231,7 @@ lab sim  --seed 42 --nodes 3 --ops 500 --faults partition,skew,dup
 
 - Local `Append` failure is returned to the caller and the op is not acknowledged — the "no lost event" property only covers acknowledged events.
 - Sync failures retry with jittered backoff; a node stays fully usable offline indefinitely.
-- Malformed remote event (unknown kind, unparseable payload): reject that frame, log loudly, continue the session. Never persist an event the local `crdt` package cannot apply, or convergence breaks silently.
+- Malformed remote event (unknown kind, unparseable payload): reject that frame, log loudly, continue the session. Never persist an event the local `crdt` package cannot apply, or convergence breaks silently. There is currently no protocol-level outcome distinguishing this from a transient drop, so a persistently malformed event retries every session indefinitely — an accepted, documented limitation (see `sync/` above), not silent data loss, since the event was never valid in the first place.
 - Version vector regression from a peer (claims to have less than it acked before): log and re-send from the lower point. Harmless given idempotent append.
 
 ## Milestones

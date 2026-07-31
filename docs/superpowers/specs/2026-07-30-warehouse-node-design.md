@@ -28,7 +28,7 @@ UI, authentication/authorization (single trusted operator per node), purchase-or
 | No duplicate receipt of the same supplier delivery note | **Central** | Cross-node duplicate detection. |
 | Transfer received quantity ≤ dispatched quantity | **Central** | Requires both halves, which live on different nodes. |
 
-Node-enforceable invariants are checked **before** the event is appended — the command is rejected outright and the operator sees the error immediately. Central-enforceable invariants are checked **after** the fact, and rejection arrives as a compensating event.
+Node-enforceable invariants are checked **before** the event is appended — the command is rejected outright and the operator sees the error immediately. Validation, append, and state/projection update happen while holding the node service's single command mutex, so two concurrent gRPC commands can never both observe the same available stock, both pass validation, and both append conflicting events — the second command sees the first one's effect before it validates. Central-enforceable invariants are checked **after** the fact, and rejection arrives as a compensating event.
 
 ## Domain model
 
@@ -83,19 +83,22 @@ Compensating event types:
 
 | Rejection | Compensation |
 |---|---|
-| Receipt exceeds open PO | `StockAdjusted` removing the excess, reason `po_overreceipt`, plus `ReceiptLineRecorded` reversal |
-| Duplicate delivery note | `StockAdjusted` removing the full duplicated line, reason `duplicate_receipt` |
-| Unknown or deleted SKU | `StockAdjusted` to zero for that SKU/location, reason `unknown_sku`, and the SKU is flagged for manual cleanup |
+| Receipt exceeds open PO | `StockAdjusted` reversing only the excess quantity of that receipt line, reason `po_overreceipt`, plus `ReceiptLineRecorded` reversal |
+| Duplicate delivery note | `StockAdjusted` reversing exactly the duplicated line's quantity, reason `duplicate_receipt` |
+| Unknown or deleted SKU | `StockAdjusted` reversing exactly the rejected event's SKU/location/lot quantity, reason `unknown_sku`, and the SKU is flagged for manual cleanup — never zeroing the aggregate, which would also erase unrelated stock recorded against that SKU before or after it was deleted |
 | Transfer to unknown/rejecting node | `StockAdjusted` restoring source stock, reason `transfer_rejected`, transfer marked failed |
 | `TransferReceived` exceeds dispatched | `StockAdjusted` removing the excess at destination, reason `transfer_overreceipt` |
+| `TransferReceived` with no matching `TransferDispatched` (including one that never arrives within the discrepancy window) | Treated as the zero-dispatched-quantity case of the over-receipt rule above: `StockAdjusted` removing the full received quantity at destination, reason `transfer_overreceipt`, and the transfer's in-transit balance is left at zero since no dispatch ever moved it there |
 
 Compensating events flow down on the same sync stream and are applied by the node exactly like any other event. A node cannot refuse a compensation — that is what makes central authoritative. The node surfaces them in an **exceptions** projection so the operator sees what was reversed and why.
 
 **Critical property:** compensation must be safe even though the node has continued working. Compensating a receipt whose stock has already been picked and shipped can drive a location negative. The spec accepts negative balances arising from compensation, flags them in the exceptions projection, and requires human resolution via a stock count. Attempting to cascade compensation through downstream events is explicitly out of scope — that way lies distributed rollback, and real ERPs do not do it either.
 
+**Arbitration is atomic and idempotent.** Each incoming event's verdict, projection update, and compensation intent are persisted in a single Postgres transaction against the decisions table (`event_id`, `verdict`, `reason`, `compensating_event_id`), with a unique constraint on `event_id`. Before evaluating a rule, the arbiter first checks for an existing decision for that `event_id`; if one exists, its recorded verdict and `compensating_event_id` are returned as-is instead of re-running validators. This makes retries after a crash or a redelivered event safe: an event can be evaluated at most once, and a compensating event is emitted at most once per rejected event.
+
 ## Architecture
 
-```
+```text
 warehouse-node/
   cmd/node/          node server: gRPC API + sync client
   cmd/central/       central server: gRPC sync server + arbitration
@@ -136,6 +139,7 @@ gRPC, for the operator client (`proto/node_api.proto`): `Receive`, `PutAway`, `P
 ## Testing
 
 - `internal/domain`: table-driven tests per invariant, pure, no I/O. Negative stock, over-reservation, expired lot, bad UoM, unknown SKU against a stale master.
+- `internal/node`: concurrent-pick regression test — two goroutines racing `Service.Execute` against the same available stock must not both succeed; exactly one observes the other's effect and is rejected for over-reservation/negative stock.
 - `internal/eventlog`: idempotent append, crash mid-transaction, replay determinism, projection rebuild equivalence.
 - `internal/arbiter`: one test per rejection rule, asserting the exact compensating event emitted, including `CausationID`.
 - **Integration:** two nodes plus central, in-process, transport injectable. Scenarios:
@@ -154,7 +158,7 @@ gRPC, for the operator client (`proto/node_api.proto`): `Receive`, `PutAway`, `P
 - Node-invariant violation: command rejected, nothing appended, error returned with the violated rule named.
 - Central unreachable: node fully operational, events queue in the log, backoff retry.
 - Central rejects an event: never dropped; compensation emitted, exceptions projection updated. Operator-visible.
-- Unparseable event from central: session fails loudly, cursor not advanced, retried. Never skip an event from the authority — skipping silently forks state.
+- Unparseable event from central: session fails loudly, cursor not advanced, retried. Never skip an event from the authority — skipping silently forks state. If the same event fails repeatedly (a poison event), the raw frame and failure are persisted to a quarantine table and the sync session resumes past it instead of retrying forever; the quarantined event is surfaced to the operator for manual recovery and never silently applied or dropped.
 - Projection code change: version bump triggers full rebuild on startup.
 
 ## Milestones

@@ -22,7 +22,7 @@ This is not a simplification that hides a problem; it is a real architectural pa
 
 Stated limitation, documented in the README: if two nodes must write the same key, this design does not apply, and the reader should look at `eventlog-lab` (mathematical merge) or `warehouse-node` (arbitration).
 
-Cross-node movement still exists — a transfer — and works without shared keys: source decrements its own balance, destination increments its own. Central sees both as ordinary per-node deltas. No in-transit accounting, no two-phase handshake; the goods are simply absent from the global sum between the two events, and that gap is documented as accepted.
+Cross-node movement still exists — a transfer — and works without shared keys, and without a second record. A `Moved` event is a *single* record, authored and validated only by the source node (`From` must be a location it owns; `To` may live anywhere). The reducer applies both halves of that one record — debit `From`, credit `To` — wherever it is replayed: immediately in the source's own projection, and again in the destination's projection once sync replicates the record there. The destination never authors or validates its own half; it only learns of the transfer through sync. Central sees the same single record and reflects both the debit and credit in its per-node sums. No in-transit accounting, no two-phase handshake; the goods are simply absent from the global sum until sync delivers the record to the destination, and that gap is documented as accepted.
 
 ## Domain (deliberately minimal)
 
@@ -42,7 +42,7 @@ One invariant, checked locally before append: balance never goes negative. A nod
 
 Six packages. The domain-agnostic ones know nothing about inventory.
 
-```
+```text
 localfirst-go/
   eventlog/     domain-agnostic append-only log        (no inventory imports)
   clock/        hybrid logical clock                    (no inventory imports)

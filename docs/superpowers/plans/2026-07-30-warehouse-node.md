@@ -210,7 +210,10 @@ func TestLocationTypeValid(t *testing.T) {
 ```go
 package domain
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestTick(t *testing.T) {
 	tests := []struct {
@@ -242,6 +245,14 @@ func TestTick(t *testing.T) {
 			prev: HLC{},
 			now:  10,
 			want: HLC{Wall: 10, Counter: 0, Node: "a"},
+		},
+		{
+			// A saturated counter must carry into the wall component. Wrapping to
+			// zero would move the clock backwards and break the total order.
+			name: "saturated counter carries into the wall",
+			prev: HLC{Wall: 100, Counter: math.MaxUint32, Node: "a"},
+			now:  50,
+			want: HLC{Wall: 101, Counter: 0, Node: "a"},
 		},
 	}
 	for _, tt := range tests {
@@ -288,6 +299,13 @@ func TestMerge(t *testing.T) {
 			now:    200,
 			want:   HLC{Wall: 300, Counter: 10, Node: "a"},
 		},
+		{
+			name:   "saturated counter carries into the wall",
+			local:  HLC{Wall: 300, Counter: math.MaxUint32, Node: "a"},
+			remote: HLC{Wall: 300, Counter: 1, Node: "b"},
+			now:    200,
+			want:   HLC{Wall: 301, Counter: 0, Node: "a"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -311,6 +329,10 @@ func TestHLCCompare(t *testing.T) {
 		{"node breaks tie less", HLC{Wall: 1, Counter: 1, Node: "a"}, HLC{Wall: 1, Counter: 1, Node: "b"}, -1},
 		{"node breaks tie greater", HLC{Wall: 1, Counter: 1, Node: "c"}, HLC{Wall: 1, Counter: 1, Node: "b"}, 1},
 		{"fully equal", HLC{Wall: 1, Counter: 1, Node: "a"}, HLC{Wall: 1, Counter: 1, Node: "a"}, 0},
+		// Extreme walls must still order correctly: subtracting them would overflow
+		// and report the opposite answer.
+		{"extreme walls do not overflow", HLC{Wall: math.MinInt64}, HLC{Wall: math.MaxInt64}, -1},
+		{"extreme walls reversed", HLC{Wall: math.MaxInt64}, HLC{Wall: math.MinInt64}, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -399,6 +421,8 @@ type StockKey struct {
 ```go
 package domain
 
+import "math"
+
 // HLC is a hybrid logical clock reading. Wall is Unix milliseconds, Counter
 // disambiguates events sharing a wall reading, and Node breaks remaining ties so
 // that ordering is total across nodes without requiring synchronised clocks.
@@ -412,27 +436,37 @@ type HLC struct {
 }
 
 // Compare returns -1, 0 or 1 ordering a before, equal to, or after other.
+// Fields are compared relationally rather than by subtraction: a remote reading
+// is untrusted input, and `h.Wall - other.Wall` overflows for extreme values,
+// which would invert the very ordering this type promises.
 func (h HLC) Compare(other HLC) int {
 	switch {
 	case h.Wall != other.Wall:
-		return sign(h.Wall - other.Wall)
+		return less(h.Wall < other.Wall)
 	case h.Counter != other.Counter:
-		return sign(int64(h.Counter) - int64(other.Counter))
+		return less(h.Counter < other.Counter)
 	case h.Node != other.Node:
-		if h.Node < other.Node {
-			return -1
-		}
-		return 1
+		return less(h.Node < other.Node)
 	default:
 		return 0
 	}
 }
 
-func sign(d int64) int {
-	if d < 0 {
+func less(isLess bool) int {
+	if isLess {
 		return -1
 	}
 	return 1
+}
+
+// bump returns the reading one logical step after (wall, counter). A saturated
+// counter carries into the wall component instead of wrapping to zero, which
+// would silently send the clock backwards.
+func bump(wall int64, counter uint32, node NodeID) HLC {
+	if counter == math.MaxUint32 {
+		return HLC{Wall: wall + 1, Counter: 0, Node: node}
+	}
+	return HLC{Wall: wall, Counter: counter + 1, Node: node}
 }
 
 // Tick produces the next local HLC for an event emitted now. If the wall clock
@@ -443,7 +477,7 @@ func Tick(prev HLC, nowMillis int64, node NodeID) HLC {
 	if nowMillis > prev.Wall {
 		return HLC{Wall: nowMillis, Counter: 0, Node: node}
 	}
-	return HLC{Wall: prev.Wall, Counter: prev.Counter + 1, Node: node}
+	return bump(prev.Wall, prev.Counter, node)
 }
 
 // Merge produces the next local HLC after observing a remote reading, which is
@@ -455,11 +489,11 @@ func Merge(local, remote HLC, nowMillis int64, node NodeID) HLC {
 	case maxWall == nowMillis && nowMillis > local.Wall && nowMillis > remote.Wall:
 		return HLC{Wall: nowMillis, Counter: 0, Node: node}
 	case local.Wall == remote.Wall && local.Wall == maxWall:
-		return HLC{Wall: maxWall, Counter: maxU32(local.Counter, remote.Counter) + 1, Node: node}
+		return bump(maxWall, maxU32(local.Counter, remote.Counter), node)
 	case local.Wall == maxWall:
-		return HLC{Wall: maxWall, Counter: local.Counter + 1, Node: node}
+		return bump(maxWall, local.Counter, node)
 	default:
-		return HLC{Wall: maxWall, Counter: remote.Counter + 1, Node: node}
+		return bump(maxWall, remote.Counter, node)
 	}
 }
 
@@ -584,6 +618,7 @@ func TestIsViolation(t *testing.T) {
 package domain
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -622,6 +657,22 @@ func TestItemToBase(t *testing.T) {
 		},
 		{name: "zero quantity is rejected", item: widget(), qty: 0, uom: "EA", wantErr: RuleQtyPositive},
 		{name: "negative quantity is rejected", item: widget(), qty: -1, uom: "EA", wantErr: RuleQtyPositive},
+		{name: "NaN quantity is rejected", item: widget(), qty: math.NaN(), uom: "EA", wantErr: RuleQtyPositive},
+		{name: "infinite quantity is rejected", item: widget(), qty: math.Inf(1), uom: "EA", wantErr: RuleQtyPositive},
+		{
+			name:    "NaN conversion factor in master is rejected",
+			item:    Item{SKU: "X", BaseUoM: "EA", AltUoM: map[UoM]float64{"BAD": math.NaN()}},
+			qty:     1,
+			uom:     "BAD",
+			wantErr: RuleUoMValid,
+		},
+		{
+			name:    "infinite conversion factor in master is rejected",
+			item:    Item{SKU: "X", BaseUoM: "EA", AltUoM: map[UoM]float64{"BAD": math.Inf(1)}},
+			qty:     1,
+			uom:     "BAD",
+			wantErr: RuleUoMValid,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -656,6 +707,21 @@ func TestLotExpiredAt(t *testing.T) {
 		{"later that same day is still usable", lot, expiry.Add(23 * time.Hour), false},
 		{"day after is expired", lot, expiry.AddDate(0, 0, 1), true},
 		{"no expiry date never expires", Lot{ID: "L2", SKU: "WIDGET"}, expiry.AddDate(9, 0, 0), false},
+		{
+			// ExpiresOn is a calendar date. Only its year/month/day matter: a lot
+			// dated 2026-07-30 in +07:00 is usable for all of 2026-07-30 in UTC and
+			// must not expire early just because its instant lands on 07-29Z.
+			"non-utc expiry date is read as its calendar day",
+			Lot{ID: "L3", SKU: "WIDGET", ExpiresOn: time.Date(2026, 7, 30, 0, 0, 0, 0, time.FixedZone("ICT", 7*3600))},
+			time.Date(2026, 7, 30, 23, 0, 0, 0, time.UTC),
+			false,
+		},
+		{
+			"non-utc expiry date expires the next utc day",
+			Lot{ID: "L3", SKU: "WIDGET", ExpiresOn: time.Date(2026, 7, 30, 0, 0, 0, 0, time.FixedZone("ICT", 7*3600))},
+			time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC),
+			true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -845,7 +911,10 @@ func IsViolation(err error, rule string) bool {
 ```go
 package domain
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // UoM is a unit of measure code, such as "EA" or "CASE".
 type UoM string
@@ -874,9 +943,11 @@ type Item struct {
 // ToBase converts an operator-entered quantity into base units, enforcing the
 // node-side "UoM conversion valid for item" invariant: the unit must be the base
 // unit or one of this item's declared alternates, with a usable factor.
+// NaN and ±Inf are rejected explicitly: both slip past a plain `<= 0` check and
+// would otherwise multiply into stock balances that no later count can repair.
 func (i Item) ToBase(qty float64, u UoM) (float64, error) {
-	if qty <= 0 {
-		return 0, Violation(RuleQtyPositive, "quantity %v must be greater than zero", qty)
+	if math.IsNaN(qty) || math.IsInf(qty, 0) || qty <= 0 {
+		return 0, Violation(RuleQtyPositive, "quantity %v must be finite and greater than zero", qty)
 	}
 	if u == i.BaseUoM {
 		return qty, nil
@@ -885,8 +956,8 @@ func (i Item) ToBase(qty float64, u UoM) (float64, error) {
 	if !ok {
 		return 0, Violation(RuleUoMValid, "uom %q is not base %q nor an alternate of sku %s", u, i.BaseUoM, i.SKU)
 	}
-	if factor <= 0 {
-		return 0, Violation(RuleUoMValid, "uom %q of sku %s has non-positive conversion factor %v", u, i.SKU, factor)
+	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor <= 0 {
+		return 0, Violation(RuleUoMValid, "uom %q of sku %s has conversion factor %v, which must be finite and positive", u, i.SKU, factor)
 	}
 	return qty * factor, nil
 }
@@ -903,11 +974,16 @@ type Lot struct {
 // date, not a timestamp: the whole expiry day is still usable, so only the day
 // after counts as expired. That coarseness is why the node's local clock is good
 // enough to enforce this invariant without consulting central.
+//
+// Only ExpiresOn's calendar year/month/day are read, and the boundary is built in
+// UTC. Truncating the instant instead would fold the zone offset of a non-UTC
+// ExpiresOn into the comparison and expire the lot up to a day early or late.
 func (l Lot) ExpiredAt(t time.Time) bool {
 	if l.ExpiresOn.IsZero() {
 		return false
 	}
-	last := l.ExpiresOn.AddDate(0, 0, 1).Truncate(24 * time.Hour)
+	y, m, d := l.ExpiresOn.Date()
+	last := time.Date(y, m, d+1, 0, 0, 0, 0, time.UTC)
 	return !t.UTC().Before(last)
 }
 ```
@@ -1111,7 +1187,19 @@ var payloadFactories = map[string]func() any{
 
 // NewEnvelope seals an Event into its stored form with the given identity, clock
 // reading and optional causation link.
+//
+// The payload's concrete type must be the one registered for e.Type. Without
+// that check any struct marshals under any type name and the log accepts an
+// envelope whose payload decodes to a zero value later — a `PutAway` that moves
+// nothing. The log is the source of truth, so a wrong shape must never enter it.
 func NewEnvelope(id EventID, hlc HLC, recordedAt time.Time, causation *EventID, e Event) (Envelope, error) {
+	factory, ok := payloadFactories[e.Type]
+	if !ok {
+		return Envelope{}, fmt.Errorf("unknown event type %q", e.Type)
+	}
+	if want, got := reflect.TypeOf(factory()).Elem(), reflect.TypeOf(e.Payload); want != got {
+		return Envelope{}, fmt.Errorf("event type %s requires payload %s, got %s", e.Type, want, got)
+	}
 	raw, err := json.Marshal(e.Payload)
 	if err != nil {
 		return Envelope{}, fmt.Errorf("encode payload of %s: %w", e.Type, err)
@@ -1599,7 +1687,30 @@ type State struct {
 	// event central emitted to undo one of ours. The exceptions projection is
 	// built from these.
 	Compensations []Envelope
+	// PendingReceipts holds TransferReceived lines that arrived before this node
+	// learned the matching TransferDispatched metadata, keyed by TransferID. Sync
+	// delivery across different aggregates is not guaranteed to preserve the
+	// causal dispatch-before-receipt order, and a receipt arriving first must not
+	// be silently discarded — the corresponding TransferDispatched folds any
+	// pending lines in once it arrives.
+	PendingReceipts map[string][]Movement
+	// Home is this node's own identity. It is empty by default (used by pure
+	// domain tests that only ever apply a single node's own events, where every
+	// TransferDispatched/TransferReceived folded in is unconditionally this
+	// node's own movement). A node.Service sets it via SetHome so that a
+	// TransferDispatched or TransferReceived forwarded by central purely for
+	// metadata — because it did not originate here and was not addressed here —
+	// updates transfer bookkeeping only and never moves stock. Without this gate,
+	// the destination of a transfer folds the source's own From/To locations into
+	// its own Stock map the moment central relays the dispatch for visibility,
+	// corrupting the destination's projection with balances at locations it does
+	// not own.
+	Home NodeID
 }
+
+// SetHome fixes this state's own node identity after construction. Call it once,
+// before applying any events, on any State backing a running node.Service.
+func (s *State) SetHome(id NodeID) { s.Home = id }
 
 // NewState returns an empty state with every map ready to use.
 func NewState() *State {
@@ -1609,9 +1720,10 @@ func NewState() *State {
 		Lots:         map[string]Lot{},
 		Stock:        map[StockKey]float64{},
 		Reservations: map[string]Reservation{},
-		Receipts:     map[string]*ReceiptState{},
-		Transfers:    map[string]*TransferState{},
-		Counts:       map[string]*CountState{},
+		Receipts:        map[string]*ReceiptState{},
+		Transfers:       map[string]*TransferState{},
+		Counts:          map[string]*CountState{},
+		PendingReceipts: map[string][]Movement{},
 	}
 }
 
@@ -1691,27 +1803,69 @@ func (s *State) Apply(envelope Envelope) error {
 			r.Status = ReceiptClosedStatus
 		}
 	case TransferDispatched:
-		t := &TransferState{
-			ID: p.TransferID, FromNode: p.FromNode, ToNode: p.ToNode,
-			Dispatched: map[StockKey]float64{}, Received: map[StockKey]float64{},
-			Status: TransferInFlight,
+		t, existing := s.Transfers[p.TransferID]
+		if !existing {
+			t = &TransferState{
+				ID: p.TransferID, FromNode: p.FromNode, ToNode: p.ToNode,
+				Dispatched: map[StockKey]float64{}, Received: map[StockKey]float64{},
+				Status: TransferInFlight,
+			}
 		}
+		// Only the originating node's own stock actually left a shelf. Central
+		// also relays this same event to the destination purely so it can learn
+		// transfer metadata ahead of the truck; folding it into the destination's
+		// own Stock map there would apply the source's From/To locations against
+		// the destination's projection, corrupting it with balances at locations
+		// the destination does not own. Home == "" (a pure domain test applying
+		// only its own node's events) always applies the move, matching prior
+		// behavior.
+		mine := s.Home == "" || s.Home == p.FromNode
 		for _, line := range p.Lines {
 			t.Dispatched[StockKey{SKU: line.SKU, LotID: line.LotID}] += line.Qty
-			s.move(line)
+			if mine {
+				s.move(line)
+			}
+		}
+		// A TransferReceived for this transfer may have arrived first — sync
+		// delivery does not guarantee dispatch-before-receipt across aggregates —
+		// and been buffered in PendingReceipts instead of discarded. Fold it in now
+		// that the dispatch has finally arrived.
+		if pending, buffered := s.PendingReceipts[p.TransferID]; buffered {
+			mineRecv := s.Home == "" || s.Home == p.ToNode
+			for _, line := range pending {
+				t.Received[StockKey{SKU: line.SKU, LotID: line.LotID}] += line.Qty
+				if mineRecv {
+					s.move(line)
+				}
+			}
+			if t.Status == TransferInFlight {
+				t.Status = TransferComplete
+			}
+			delete(s.PendingReceipts, p.TransferID)
 		}
 		s.Transfers[p.TransferID] = t
 	case TransferReceived:
 		t, ok := s.Transfers[p.TransferID]
 		if !ok {
-			// The destination node learns of the dispatch only via central. If
-			// the receive is folded first, ignore it; the dispatch fills in the
-			// rest when it arrives.
+			// This node has not learned the matching TransferDispatched metadata
+			// yet. The receipt is not discarded: it is buffered so the dispatch,
+			// whenever it arrives, can fold it in and the transfer never gets
+			// stuck showing zero received despite the receipt already being in
+			// the log.
+			s.PendingReceipts[p.TransferID] = append(s.PendingReceipts[p.TransferID], p.Lines...)
 			return nil
 		}
+		// Symmetric with the dispatch case above: this event moved stock only at
+		// the destination that actually received it. Central also relays it back
+		// to the source purely for transfer-projection visibility (so the
+		// source's view of the transfer does not stay stuck in-flight forever),
+		// and that relay must not move stock at the source.
+		mine := s.Home == "" || s.Home == t.ToNode
 		for _, line := range p.Lines {
 			t.Received[StockKey{SKU: line.SKU, LotID: line.LotID}] += line.Qty
-			s.move(line)
+			if mine {
+				s.move(line)
+			}
 		}
 		if t.Status == TransferInFlight {
 			t.Status = TransferComplete
@@ -2967,6 +3121,7 @@ func TestDoDispatchTransferRejectsDuplicateID(t *testing.T) {
 func dispatchedInto(t *testing.T, day time.Time, qty float64) *State {
 	t.Helper()
 	s := NewState()
+	s.SetHome("wh-b")
 	applyEvents(t, s, 1, day,
 		Event{Type: TypeItemUpserted, AggregateID: "WIDGET", Payload: ItemUpserted{Item: widget()}},
 		Event{Type: TypeLocationRegistered, AggregateID: "RECV-01", Payload: LocationRegistered{Code: "RECV-01", Type: LocReceiving}},
@@ -2976,6 +3131,68 @@ func dispatchedInto(t *testing.T, day time.Time, qty float64) *State {
 		}},
 	)
 	return s
+}
+
+// TestForwardedDispatchDoesNotMoveDestinationStock proves that folding in a
+// TransferDispatched relayed by central for metadata only updates the destination's
+// transfer bookkeeping, never its Stock map — the source's own From/To locations
+// (here PICK-01 and external) must not appear as balances on a node that never
+// physically held that stock.
+func TestForwardedDispatchDoesNotMoveDestinationStock(t *testing.T) {
+	day := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	s := dispatchedInto(t, day, 5)
+	if got := s.OnHand(StockKey{SKU: "WIDGET", Location: "PICK-01", LotID: "L1"}); got != 0 {
+		t.Fatalf("destination on-hand at the source's own location = %v, want 0", got)
+	}
+	if got := s.OnHand(StockKey{SKU: "WIDGET", Location: External, LotID: "L1"}); got != 0 {
+		t.Fatalf("destination on-hand at the external sentinel = %v, want 0", got)
+	}
+	key := StockKey{SKU: "WIDGET", LotID: "L1"}
+	if got := s.Transfers["T1"].Dispatched[key]; got != 5 {
+		t.Fatalf("transfer metadata still tracks dispatched qty = %v, want 5", got)
+	}
+}
+
+// TestTransferReceivedBeforeDispatchIsNotLost proves a TransferReceived that
+// arrives before its matching TransferDispatched metadata is buffered rather than
+// discarded, and is correctly folded in once the dispatch shows up.
+func TestTransferReceivedBeforeDispatchIsNotLost(t *testing.T) {
+	day := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	s := NewState()
+	s.SetHome("wh-b")
+	applyEvents(t, s, 1, day,
+		Event{Type: TypeItemUpserted, AggregateID: "WIDGET", Payload: ItemUpserted{Item: widget()}},
+		Event{Type: TypeLocationRegistered, AggregateID: "RECV-01", Payload: LocationRegistered{Code: "RECV-01", Type: LocReceiving}},
+		Event{Type: TypeTransferReceived, AggregateID: "T1", Payload: TransferReceived{
+			TransferID: "T1", Lines: []Movement{{SKU: "WIDGET", LotID: "L1", From: External, To: "RECV-01", Qty: 5}},
+		}},
+	)
+	if _, ok := s.Transfers["T1"]; ok {
+		t.Fatalf("transfer T1 should not exist yet: only the receipt has arrived")
+	}
+	if got := len(s.PendingReceipts["T1"]); got != 1 {
+		t.Fatalf("pending receipts for T1 = %d, want 1 (buffered, not discarded)", got)
+	}
+
+	applyEvents(t, s, 2, day,
+		Event{Type: TypeTransferDispatched, AggregateID: "T1", Payload: TransferDispatched{
+			TransferID: "T1", FromNode: "wh-a", ToNode: "wh-b",
+			Lines: []Movement{{SKU: "WIDGET", LotID: "L1", From: "PICK-01", To: External, Qty: 5}},
+		}},
+	)
+	key := StockKey{SKU: "WIDGET", LotID: "L1"}
+	if got := s.Transfers["T1"].Received[key]; got != 5 {
+		t.Fatalf("received qty after dispatch arrives = %v, want 5 (folded in from the buffer)", got)
+	}
+	if s.Transfers["T1"].Status != TransferComplete {
+		t.Fatalf("status = %q, want %q", s.Transfers["T1"].Status, TransferComplete)
+	}
+	if _, buffered := s.PendingReceipts["T1"]; buffered {
+		t.Fatalf("pending receipt for T1 should be cleared once folded in")
+	}
+	if got := s.OnHand(StockKey{SKU: "WIDGET", Location: "RECV-01", LotID: "L1"}); got != 5 {
+		t.Fatalf("destination on-hand = %v, want 5", got)
+	}
 }
 
 func TestTransferStateInTransit(t *testing.T) {
@@ -5098,8 +5315,9 @@ CREATE TABLE IF NOT EXISTS reservations (
 );
 
 CREATE TABLE IF NOT EXISTS projection_applied (
-    node_id TEXT    PRIMARY KEY,
-    seq     INTEGER NOT NULL
+    node_id TEXT    NOT NULL,
+    seq     INTEGER NOT NULL,
+    PRIMARY KEY (node_id, seq)
 );
 `
 
@@ -5158,18 +5376,22 @@ func (s *Set) CatchUp() error {
 	return nil
 }
 
-// Apply folds one event into every projection. It is idempotent: an event whose
-// sequence is at or below the highest already applied for its node is skipped, so
-// re-delivery on a resumed sync stream cannot double-count stock.
+// Apply folds one event into every projection. It is idempotent: the exact
+// (node, seq) pair already applied is recorded and re-checked, so re-delivery on a
+// resumed sync stream cannot double-count stock. This is deliberately not "skip if
+// seq <= the highest seen" — that would treat the highest sequence as a contiguous
+// cursor and permanently lose any event that arrives out of order (seq 4 delivered
+// after seq 5 would be dropped forever). Recording every applied seq individually
+// means an out-of-order arrival is still folded in exactly once.
 //
 // An event that cannot be decoded is an error, never a skip: silently ignoring an
 // event forks this node's state from the rest of the system.
 func (s *Set) Apply(env domain.Envelope) error {
-	applied, err := s.appliedSeq(env.ID.NodeID)
+	already, err := s.isApplied(env.ID.NodeID, env.ID.Seq)
 	if err != nil {
 		return err
 	}
-	if env.ID.Seq <= applied {
+	if already {
 		return nil
 	}
 	payload, err := domain.DecodePayload(env)
@@ -5183,14 +5405,14 @@ func (s *Set) Apply(env domain.Envelope) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := applyStock(tx, payload); err != nil {
+	if err := applyStock(tx, s.log.NodeID(), payload); err != nil {
 		return err
 	}
 	if err := applyReservation(tx, payload); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO projection_applied (node_id, seq) VALUES (?, ?)
-		ON CONFLICT (node_id) DO UPDATE SET seq = excluded.seq`, string(env.ID.NodeID), env.ID.Seq); err != nil {
+		ON CONFLICT (node_id, seq) DO NOTHING`, string(env.ID.NodeID), env.ID.Seq); err != nil {
 		return fmt.Errorf("record applied %s: %w", env.ID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -5199,16 +5421,28 @@ func (s *Set) Apply(env domain.Envelope) error {
 	return nil
 }
 
-func (s *Set) appliedSeq(node domain.NodeID) (uint64, error) {
-	var seq sql.NullInt64
-	err := s.db.QueryRow(`SELECT seq FROM projection_applied WHERE node_id = ?`, string(node)).Scan(&seq)
+// IsApplied reports whether this exact event has already been folded into the
+// projections. Callers that must recover from a failed application (Service.apply)
+// use this as the durable source of truth for "does this event still need work",
+// rather than a version-vector or highest-seq comparison that would mistake a
+// not-yet-applied gap for done.
+func (s *Set) IsApplied(id domain.EventID) (bool, error) { return s.isApplied(id.NodeID, id.Seq) }
+
+// isApplied reports whether this exact (node, seq) event has already been folded
+// into the projections, not merely whether a higher sequence for the node has been
+// seen — a gappy delivery order must not cause a lower, not-yet-applied sequence to
+// be mistaken for already-applied.
+func (s *Set) isApplied(node domain.NodeID, seq uint64) (bool, error) {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM projection_applied WHERE node_id = ? AND seq = ?`,
+		string(node), seq).Scan(&one)
 	switch {
 	case err == sql.ErrNoRows:
-		return 0, nil
+		return false, nil
 	case err != nil:
-		return 0, fmt.Errorf("read applied seq for %s: %w", node, err)
+		return false, fmt.Errorf("read applied for %s/%d: %w", node, seq, err)
 	}
-	return uint64(seq.Int64), nil
+	return true, nil
 }
 
 // MovementsOf returns the stock movements a payload carries, and is the single place
@@ -5260,7 +5494,29 @@ type StockRow struct {
 // is balanced this is one code path: subtract at From, add at To. Rows reaching zero
 // are deleted so the table is a canonical representation of the same balances no
 // matter which order events arrived in.
-func applyStock(tx *sql.Tx, payload any) error {
+//
+// home is this node's own identity. Central relays TransferDispatched to the
+// destination, and TransferReceived back to the source, purely so each side's
+// transfer metadata (applyTransfer, in transfer.go) stays current — neither relay
+// represents stock physically moving at the node receiving the relay, and folding
+// it into stock_on_hand there would apply the other node's From/To locations
+// against this node's own balances. home == "" (used by tests that only ever
+// project a single node's own events without a home set) always applies the move.
+func applyStock(tx *sql.Tx, home domain.NodeID, payload any) error {
+	switch p := payload.(type) {
+	case domain.TransferDispatched:
+		if home != "" && home != p.FromNode {
+			return nil
+		}
+	case domain.TransferReceived:
+		toNode, err := transferToNode(tx, p.TransferID)
+		if err != nil {
+			return err
+		}
+		if home != "" && toNode != "" && home != toNode {
+			return nil
+		}
+	}
 	for _, m := range MovementsOf(payload) {
 		if err := addStock(tx, m.FromKey(), -m.Qty); err != nil {
 			return err
@@ -5270,6 +5526,24 @@ func applyStock(tx *sql.Tx, payload any) error {
 		}
 	}
 	return nil
+}
+
+// transferToNode looks up the destination node of a transfer from the transfers
+// projection (populated by applyTransfer from the TransferDispatched half), so
+// applyStock can tell whether a TransferReceived it is folding in happened at this
+// node or is a metadata-only relay from central. An unknown transfer (not yet seen,
+// or the transfers table does not exist yet in code predating that projection)
+// returns "" and applyStock treats it as "apply", matching prior behavior.
+func transferToNode(tx *sql.Tx, id string) (domain.NodeID, error) {
+	var to string
+	err := tx.QueryRow(`SELECT to_node FROM transfers WHERE id = ?`, id).Scan(&to)
+	switch {
+	case err == sql.ErrNoRows:
+		return "", nil
+	case err != nil:
+		return "", nil // no transfers table yet (pre-Task-16 code): fall back to always applying
+	}
+	return domain.NodeID(to), nil
 }
 
 func addStock(tx *sql.Tx, k domain.StockKey, delta float64) error {
@@ -6297,6 +6571,7 @@ package node
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -6442,6 +6717,66 @@ func TestIngestAppliesCompensationsAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestConcurrentExecuteSerializesAgainstSameStock proves two commands racing the
+// same available stock cannot both observe it available: Execute holds the
+// service's single command mutex across validate-append-apply, so the second
+// goroutine to run always sees the first's effect and is rejected for
+// over-reservation instead of both succeeding and driving stock negative.
+func TestConcurrentExecuteSerializesAgainstSameStock(t *testing.T) {
+	svc := openService(t, "wh-a")
+	if err := svc.RegisterLocation("PICK-01", domain.LocPick); err != nil {
+		t.Fatalf("RegisterLocation: %v", err)
+	}
+	if _, err := svc.Execute(func(s *domain.State) ([]domain.Event, error) {
+		return domain.DoReceive(s, domain.ReceiveCmd{ReceiptID: "R1", DeliveryNote: "DN-1", PORef: "PO-1",
+			Line: domain.Line{SKU: "WIDGET", LotID: "L1", Qty: 10, UoM: "EA"}, To: "PICK-01"})
+	}); err != nil {
+		t.Fatalf("seed receipt: %v", err)
+	}
+
+	pick := func() (bool, error) {
+		_, err := svc.Execute(func(s *domain.State) ([]domain.Event, error) {
+			return domain.DoPick(s, domain.PickCmd{
+				Line: domain.Line{SKU: "WIDGET", LotID: "L1", Qty: 6, UoM: "EA"},
+				From: "PICK-01", OrderRef: "O1", At: time.Date(2026, 7, 30, 1, 0, 0, 0, time.UTC),
+			})
+		})
+		return err == nil, err
+	}
+
+	var wg sync.WaitGroup
+	results := make([]bool, 2)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ok, err := pick()
+			if err != nil && !domain.IsViolation(err, domain.RuleStockNonNegative) {
+				t.Errorf("pick %d: unexpected error %v", i, err)
+			}
+			results[i] = ok
+		}(i)
+	}
+	wg.Wait()
+
+	succeeded := 0
+	for _, ok := range results {
+		if ok {
+			succeeded++
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("succeeded picks = %d, want exactly 1 (two picks of 6 against a stock of 10 must not both succeed)", succeeded)
+	}
+	bal, err := svc.StockOnHand("WIDGET", "PICK-01")
+	if err != nil {
+		t.Fatalf("StockOnHand: %v", err)
+	}
+	if len(bal) != 1 || bal[0].Qty != 4 {
+		t.Fatalf("balance = %+v, want a single row of 4", bal)
+	}
+}
+
 func TestStateSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "node.db")
@@ -6564,18 +6899,36 @@ func Open(path string, id domain.NodeID, now func() time.Time) (*Service, error)
 		return nil, err
 	}
 	s := &Service{log: log, set: set, state: domain.NewState()}
-	envs, err := log.ReadAll()
-	if err != nil {
+	s.state.SetHome(id)
+	if err := s.rebuildState(); err != nil {
 		_ = log.Close()
 		return nil, err
 	}
+	return s, nil
+}
+
+// rebuildState replays the entire log into a fresh in-memory domain.State. Unlike
+// the projections, state has no durable per-event applied marker of its own — it is
+// an in-memory derivation, so the only way to guarantee it matches the log after any
+// partial failure is to throw it away and replay from scratch. Open uses this to
+// build state the first time; apply uses it to recover state if projection
+// application fails after state application already ran, so a log event that is
+// persisted always ends up correctly reflected once the failure is retried, instead
+// of leaving the projections permanently behind the log.
+func (s *Service) rebuildState() error {
+	envs, err := s.log.ReadAll()
+	if err != nil {
+		return err
+	}
+	fresh := domain.NewState()
+	fresh.SetHome(s.log.NodeID())
 	for _, env := range envs {
-		if err := s.state.Apply(env); err != nil {
-			_ = log.Close()
-			return nil, fmt.Errorf("rebuild state: %w", err)
+		if err := fresh.Apply(env); err != nil {
+			return fmt.Errorf("rebuild state: %w", err)
 		}
 	}
-	return s, nil
+	s.state = fresh
+	return nil
 }
 
 // Close releases the underlying database.
@@ -6610,23 +6963,30 @@ func (s *Service) Execute(cmd Command) ([]domain.Envelope, error) {
 // item-master updates, and transfer events forwarded from another node. It returns
 // how many were new. There is no validation: a node cannot refuse a compensation,
 // which is what makes central authoritative.
+//
+// Which envelopes still need applying is decided by asking the projections, which
+// carry a durable per-event applied marker (Task 11), not by comparing against a
+// version vector captured before the insert. A version-vector comparison only tells
+// you what the log gained in *this* call — if a previous call persisted an event but
+// crashed or errored before applying it, that event is already reflected in the log's
+// version vector on the next call and would never be recognised as still-pending.
+// Asking the projections directly is what gives ingestion a recovery path.
 func (s *Service) Ingest(envs []domain.Envelope) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	before, err := s.log.VersionVector()
-	if err != nil {
-		return 0, err
-	}
 	n, err := s.log.Ingest(envs)
 	if err != nil {
 		return 0, err
 	}
-	fresh := make([]domain.Envelope, 0, n)
+	var fresh []domain.Envelope
 	for _, env := range envs {
-		if env.ID.Seq > before[env.ID.NodeID] {
+		applied, err := s.set.IsApplied(env.ID)
+		if err != nil {
+			return n, err
+		}
+		if !applied {
 			fresh = append(fresh, env)
-			before[env.ID.NodeID] = env.ID.Seq
 		}
 	}
 	return n, s.apply(fresh)
@@ -6649,12 +7009,22 @@ func (s *Service) RegisterLocation(code domain.LocationCode, typ domain.Location
 // apply folds envelopes into the in-memory state and the projections. State is
 // applied first because it is in memory and cannot fail partway in a way the
 // projections could observe.
+//
+// If projection application fails after state has already absorbed the same event,
+// state and the (durably marker-tracked) projections would otherwise disagree about
+// what has been applied, and the caller's retry — which recomputes "fresh" from the
+// projections' applied marker — would replay that event into state a second time.
+// Rebuilding state from the log on any failure here throws away the untracked
+// in-memory partial progress and guarantees state matches exactly what the
+// projections (and a subsequent retry) believe has been applied.
 func (s *Service) apply(envs []domain.Envelope) error {
 	for _, env := range envs {
 		if err := s.state.Apply(env); err != nil {
+			_ = s.rebuildState()
 			return err
 		}
 		if err := s.set.Apply(env); err != nil {
+			_ = s.rebuildState()
 			return err
 		}
 	}
@@ -9997,6 +10367,49 @@ func TestArbitrateAcceptsAValidReceipt(t *testing.T) {
 	}
 }
 
+// TestArbitrateIsIdempotentOnRetry proves that arbitrating the same event twice —
+// simulating a caller retrying after a crash between EmitCentral, Enqueue, and
+// RecordDecision — returns the original decision and compensations without
+// re-running validators or re-emitting a second compensating event.
+func TestArbitrateIsIdempotentOnRetry(t *testing.T) {
+	a, store := newArbiter(t)
+	ctx := context.Background()
+	e := env(t, "wh-a", 1, domain.TypeGoodsReceived, "R1",
+		goodsReceived("R1", "DN-1", "PO-1", "GHOST", "", 5, "RECV-01"))
+
+	first, firstComps, err := a.Arbitrate(ctx, e)
+	if err != nil {
+		t.Fatalf("first Arbitrate: %v", err)
+	}
+	if first.Verdict != central.VerdictRejected || len(firstComps) == 0 {
+		t.Fatalf("first decision = %+v, comps %+v; want a rejection with a compensation", first, firstComps)
+	}
+
+	second, secondComps, err := a.Arbitrate(ctx, e)
+	if err != nil {
+		t.Fatalf("second Arbitrate: %v", err)
+	}
+	if second.Verdict != first.Verdict || second.Reason != first.Reason {
+		t.Fatalf("second decision = %+v, want it to match the first %+v", second, first)
+	}
+	if len(secondComps) != len(firstComps) || secondComps[0].ID != firstComps[0].ID {
+		t.Fatalf("second comps = %+v, want exactly the first compensation replayed, not a new one", secondComps)
+	}
+	all, err := store.Events(ctx)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	compCount := 0
+	for _, ev := range all {
+		if ev.CausationID != nil && *ev.CausationID == e.ID {
+			compCount++
+		}
+	}
+	if compCount != 1 {
+		t.Fatalf("compensating events for %s = %d, want exactly 1 (no duplicate on retry)", e.ID, compCount)
+	}
+}
+
 // TestRejectionRules is one case per central-enforced invariant, asserting the exact
 // compensating event emitted: its type, reason, movement and CausationID.
 func TestRejectionRules(t *testing.T) {
@@ -10241,6 +10654,53 @@ func TestRejectionRules(t *testing.T) {
 	}
 }
 
+// TestOverReceivedTransferStillForwardsToSource proves that a TransferReceived
+// rejected as an over-receipt is still enqueued for the source node. Central
+// records the accepted portion and compensates only the excess at the
+// destination; if the receipt were never forwarded, the source's own transfer
+// projection would show the goods as in-transit forever even though they arrived.
+func TestOverReceivedTransferStillForwardsToSource(t *testing.T) {
+	a, store := newArbiter(t)
+	ctx := context.Background()
+
+	dispatch := env(t, "wh-a", 1, domain.TypeTransferDispatched, "T1", domain.TransferDispatched{
+		TransferID: "T1", FromNode: "wh-a", ToNode: "wh-b",
+		Lines: []domain.Movement{{SKU: "WIDGET", LotID: "L1", From: "PICK-01", To: domain.External, Qty: 6}}})
+	if _, _, err := a.Arbitrate(ctx, dispatch); err != nil {
+		t.Fatalf("seed dispatch: %v", err)
+	}
+
+	receipt := env(t, "wh-b", 1, domain.TypeTransferReceived, "T1", domain.TransferReceived{
+		TransferID: "T1",
+		Lines:      []domain.Movement{{SKU: "WIDGET", LotID: "L1", From: domain.External, To: "RECV-09", Qty: 10}}})
+	decision, comps, err := a.Arbitrate(ctx, receipt)
+	if err != nil {
+		t.Fatalf("Arbitrate: %v", err)
+	}
+	if decision.Verdict != central.VerdictRejected || decision.Reason != domain.ReasonTransferOverReceipt {
+		t.Fatalf("decision = %+v, want a transfer_overreceipt rejection", decision)
+	}
+	if len(comps) != 1 {
+		t.Fatalf("comps = %+v, want exactly one (the destination's excess reversal)", comps)
+	}
+
+	// The receipt event itself — not just its compensation — must reach wh-a, the
+	// transfer's source, or its transfer projection never learns the goods arrived.
+	queued, err := store.Outbound(ctx, "wh-a", 0, 10)
+	if err != nil {
+		t.Fatalf("Outbound: %v", err)
+	}
+	var forwarded bool
+	for _, q := range queued {
+		if q.Env.ID == receipt.ID {
+			forwarded = true
+		}
+	}
+	if !forwarded {
+		t.Fatalf("wh-a's outbound queue = %+v, want the original receipt %s forwarded to it", queued, receipt.ID)
+	}
+}
+
 func TestPOOverReceiptRecordsOnlyTheAcceptedPortion(t *testing.T) {
 	a, store := newArbiter(t)
 	ctx := context.Background()
@@ -10456,7 +10916,27 @@ func (a *Arbiter) Validators() []Validator { return a.validators }
 // Arbitrate persists an event, decides on it, records the consequences, and — on
 // rejection — emits and enqueues the compensating events for the node that produced
 // it. It returns the decision and the compensations.
+//
+// It is idempotent and safe to retry: before doing anything else it checks for a
+// decision already recorded against this exact event ID and, if one exists, returns
+// it and its compensations without re-running validators or re-emitting anything.
+// Without this check, a retry after a crash between EmitCentral, Enqueue, and
+// RecordDecision would re-run every side effect — duplicating a compensating event
+// and its queue entry, or (since Append is itself idempotent and silently reports no
+// new event on a retry) silently skipping arbitration on the retry while a caller
+// still waits on a decision that was never recorded for it. Checking first avoids
+// both failure modes uniformly.
 func (a *Arbiter) Arbitrate(ctx context.Context, env domain.Envelope) (central.Decision, []domain.Envelope, error) {
+	if existing, ok, err := a.store.Decision(ctx, env.ID); err != nil {
+		return central.Decision{}, nil, fmt.Errorf("check existing decision for %s: %w", env.ID, err)
+	} else if ok {
+		comps, err := a.compensationsOf(ctx, env.ID)
+		if err != nil {
+			return central.Decision{}, nil, err
+		}
+		return existing, comps, nil
+	}
+
 	if _, err := a.store.Append(ctx, []domain.Envelope{env}); err != nil {
 		return central.Decision{}, nil, err
 	}
@@ -10508,6 +10988,25 @@ func (a *Arbiter) Arbitrate(ctx context.Context, env domain.Envelope) (central.D
 // record folds the event's consequences into central's cross-node bookkeeping. For a
 // rejected receipt only the accepted portion is counted, so the purchase order is not
 // left permanently over-received by an event that was compensated away.
+// compensationsOf returns the envelopes already emitted with causation pointing at
+// id, for replaying the result of an earlier decision back to a caller that retried
+// Arbitrate. Most decisions have none (accepted) or one (rejected); it is a small
+// filter over the log rather than a dedicated index because retries are the
+// exception, not the hot path.
+func (a *Arbiter) compensationsOf(ctx context.Context, id domain.EventID) ([]domain.Envelope, error) {
+	all, err := a.store.Events(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read compensations of %s: %w", id, err)
+	}
+	var comps []domain.Envelope
+	for _, e := range all {
+		if e.CausationID != nil && *e.CausationID == id {
+			comps = append(comps, e)
+		}
+	}
+	return comps, nil
+}
+
 func (a *Arbiter) record(ctx context.Context, env domain.Envelope, payload any, rej *Rejection) error {
 	switch p := payload.(type) {
 	case domain.GoodsReceived:
@@ -10564,12 +11063,19 @@ func (a *Arbiter) record(ctx context.Context, env domain.Envelope, payload any, 
 // fanOut queues events for the other node that needs to see them. Transfers are the
 // only cross-node flow: the destination must learn of a dispatch before it can record
 // the truck arriving, and the source must learn the goods landed.
+// fanOut forwards an event to whichever node needs it for its own view of a
+// transfer. A rejected TransferDispatched suppresses fan-out entirely — the
+// transfer is dead and the destination has nothing useful to learn. A rejected
+// TransferReceived (an over-receipt) does not: central still records the accepted
+// portion and emits the destination's excess compensation separately, so the
+// source must still see the receipt event or its transfer projection stays stuck
+// showing the goods as in-transit forever.
 func (a *Arbiter) fanOut(ctx context.Context, env domain.Envelope, payload any, rej *Rejection) error {
-	if rej != nil {
-		return nil
-	}
 	switch p := payload.(type) {
 	case domain.TransferDispatched:
+		if rej != nil {
+			return nil
+		}
 		return a.store.Enqueue(ctx, p.ToNode, []domain.Envelope{env})
 	case domain.TransferReceived:
 		for _, m := range p.Lines {
@@ -11350,6 +11856,11 @@ func (s *Server) receive(stream syncpb.Sync_ReplicateServer, node domain.NodeID)
 
 // push sends everything queued for this node — compensations, item-master updates and
 // forwarded transfer events — in chunks bounded by MaxBatchEvents.
+//
+// Outbound already bounds one page to MaxBatchEvents rows, but a page of large
+// envelopes can still exceed MaxBatchBytes on the wire: Chunk splits that page
+// further before each piece is sent, so no single frame ever breaks the byte cap
+// EncodeBatch itself does not enforce.
 func (s *Server) push(stream syncpb.Sync_ReplicateServer, node domain.NodeID) error {
 	ctx := stream.Context()
 	cursor, err := s.store.DeliveredOrd(ctx, node)
@@ -11368,19 +11879,28 @@ func (s *Server) push(stream syncpb.Sync_ReplicateServer, node domain.NodeID) er
 		envs := make([]domain.Envelope, 0, len(rows))
 		for _, row := range rows {
 			envs = append(envs, row.Env)
-			cursor = row.Ord
 		}
-		remaining, err := s.store.Outbound(ctx, node, cursor, 1)
-		if err != nil {
-			return err
-		}
-		batch := EncodeBatch(envs)
-		batch.LastOrd, batch.More = cursor, len(remaining) > 0
-		if err := stream.Send(&syncpb.CentralFrame{Body: &syncpb.CentralFrame_Events{Events: batch}}); err != nil {
-			return err
-		}
-		if !batch.More {
-			return nil
+		chunks := Chunk(envs)
+		consumed := 0
+		for i, chunk := range chunks {
+			consumed += len(chunk)
+			cursor = rows[consumed-1].Ord
+			more := i < len(chunks)-1
+			if !more {
+				remaining, err := s.store.Outbound(ctx, node, cursor, 1)
+				if err != nil {
+					return err
+				}
+				more = len(remaining) > 0
+			}
+			batch := EncodeBatch(chunk)
+			batch.LastOrd, batch.More = cursor, more
+			if err := stream.Send(&syncpb.CentralFrame{Body: &syncpb.CentralFrame_Events{Events: batch}}); err != nil {
+				return err
+			}
+			if !more {
+				return nil
+			}
 		}
 	}
 }
@@ -11398,6 +11918,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/domain"
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/eventlog"
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/node"
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/proto/syncpb"
@@ -11487,38 +12008,53 @@ func (c *Client) Session(ctx context.Context) error {
 // pushBacklog sends this node's own events above from, in bounded chunks, updating the
 // push cursor from each acknowledgement. A week of backlog is many chunks, never one
 // enormous message.
+//
+// ReadOwnAfter already bounds one page to MaxBatchEvents events, but a page of large
+// envelopes can still exceed MaxBatchBytes on the wire: Chunk splits that page
+// further before each piece is sent, matching the same discipline central's push
+// applies, so neither side of the stream can send a frame past the byte cap.
 func (c *Client) pushBacklog(ctx context.Context, stream syncpb.Sync_ReplicateClient, from uint64) error {
 	for {
 		envs, err := c.svc.Log().ReadOwnAfter(from, MaxBatchEvents)
 		if err != nil {
 			return err
 		}
-		batch := EncodeBatch(envs)
-		if len(envs) > 0 {
-			from = envs[len(envs)-1].ID.Seq
-			next, err := c.svc.Log().ReadOwnAfter(from, 1)
+		chunks := Chunk(envs)
+		if len(chunks) == 0 {
+			chunks = [][]domain.Envelope{nil}
+		}
+		for i, chunk := range chunks {
+			batch := EncodeBatch(chunk)
+			more := i < len(chunks)-1
+			if len(chunk) > 0 {
+				from = chunk[len(chunk)-1].ID.Seq
+			}
+			if !more {
+				next, err := c.svc.Log().ReadOwnAfter(from, 1)
+				if err != nil {
+					return err
+				}
+				more = len(next) > 0
+			}
+			batch.More = more
+			if err := stream.Send(&syncpb.NodeFrame{Body: &syncpb.NodeFrame_Events{Events: batch}}); err != nil {
+				return err
+			}
+			ack, err := stream.Recv()
 			if err != nil {
 				return err
 			}
-			batch.More = len(next) > 0
-		}
-		if err := stream.Send(&syncpb.NodeFrame{Body: &syncpb.NodeFrame_Events{Events: batch}}); err != nil {
-			return err
-		}
-		ack, err := stream.Recv()
-		if err != nil {
-			return err
-		}
-		if ack.GetAck() == nil {
-			return errors.New("central did not acknowledge the batch")
-		}
-		if seq := ack.GetAck().GetSeq(); seq > 0 {
-			if err := c.svc.Log().SetCursor(eventlog.CursorPushed, seq); err != nil {
-				return err
+			if ack.GetAck() == nil {
+				return errors.New("central did not acknowledge the batch")
 			}
-		}
-		if !batch.GetMore() {
-			return ctx.Err()
+			if seq := ack.GetAck().GetSeq(); seq > 0 {
+				if err := c.svc.Log().SetCursor(eventlog.CursorPushed, seq); err != nil {
+					return err
+				}
+			}
+			if !batch.GetMore() {
+				return ctx.Err()
+			}
 		}
 	}
 }

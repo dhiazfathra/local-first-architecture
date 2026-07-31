@@ -26,7 +26,7 @@ Read this once; every task assumes it.
 - Central store: Postgres via `github.com/jackc/pgx/v5`.
 - Sync: gRPC bidirectional stream, **one** `Frame` message type in both directions.
 - `eventlog`, `clock`, `sync`, `projection` MUST NOT import `domain`. Enforced by test, not convention.
-- Coding standards (hard requirements): minimal boilerplate, SOLID, DRY, **100% test coverage** — every function, branch and edge case tested.
+- Coding standards (hard requirements): minimal boilerplate, SOLID, DRY, **100% test coverage** of every function, branch and edge case that contains logic, with exactly one named exception: a `func main()` that does nothing but call `Run` (or equivalent) is not covered — every line of logic lives in the function it delegates to, which is covered. No other function, branch, or package is exempt; a task whose `go tool cover -func` output shows any other uncovered line is not done.
 - Every task ends with `go test ./... -cover` and `golangci-lint run` passing, both clean, before its commit step. No task concludes with failing or skipped tests.
 - Unknown record type during projection is a **hard error**, never skipped.
 - Documentation is a deliverable: five ADRs, `docs/architecture.md` (mermaid), `docs/swapping-the-domain.md`, `docs/limitations.md`, `README.md`.
@@ -145,8 +145,7 @@ proto:
 
 demo:
 	docker compose up -d --build
-	go run ./demo/cmd/demo
-	docker compose down -v
+	go run ./demo/cmd/demo; status=$$?; docker compose down -v; exit $$status
 
 demo-down:
 	docker compose down -v
@@ -1197,8 +1196,9 @@ func (s *Store) Append(
 
 // Merge stores records authored elsewhere and returns how many were new.
 // Duplicates are ignored and are not re-projected, which is what makes an
-// at-least-once sync protocol correct. p may be nil (a node that only tracks
-// its own balances); central passes its global projector.
+// at-least-once sync protocol correct. p may be nil — central passes nil and
+// maintains no live projector at all; its global sum is a SQL query
+// (PGStore.GlobalSum) computed by replaying stored records on demand.
 func (s *Store) Merge(ctx context.Context, recs []Record, p Projector) (int, error) {
 	if len(recs) == 0 {
 		return 0, nil
@@ -2129,10 +2129,82 @@ func TestProjectAppliesRemoteRecords(t *testing.T) {
 	}
 }
 
+// TestMergeObservesPeerClockBeforeNextLocalAppend proves ADR 0003's promise:
+// after this node merges a record with a future timestamp, its own next
+// record sorts after that timestamp, not before it.
+func TestMergeObservesPeerClockBeforeNextLocalAppend(t *testing.T) {
+	ctx := context.Background()
+	store, err := eventlog.Open(filepath.Join(t.TempDir(), "n1.db"), "n1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	clk := clock.New("n1", nil)
+	inv, err := domain.NewInventory(ctx, store, clk, nil)
+	if err != nil {
+		t.Fatalf("NewInventory: %v", err)
+	}
+
+	future := eventlog.Record{
+		NodeID:  "n2",
+		Seq:     1,
+		Clock:   clock.HLC{Wall: clk.Now().Wall + 1_000_000, NodeID: "n2"},
+		Type:    domain.TypeReceived,
+		Payload: mustJSON(t, domain.Received{SKU: "S", Location: "Q", Qty: 1}),
+	}
+	if _, err := store.Merge(ctx, []eventlog.Record{future}, inv); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if err := inv.Receive(ctx, "S", "n1", 1); err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+
+	recs, err := store.Since(ctx, nil)
+	if err != nil {
+		t.Fatalf("Since: %v", err)
+	}
+	var local eventlog.Record
+	for _, r := range recs {
+		if r.NodeID == "n1" {
+			local = r
+		}
+	}
+	if c := future.Clock.Compare(local.Clock); c >= 0 {
+		t.Fatalf("local record's clock did not advance past the merged future one: future=%+v local=%+v", future.Clock, local.Clock)
+	}
+}
+
 func TestCheckRejectsUnknownType(t *testing.T) {
 	inv, _ := newInv(t, "A")
 	if err := inv.Check(eventlog.Record{NodeID: "n1", Seq: 1, Type: "inventory.Teleported"}); !errors.Is(err, eventlog.ErrUnknownType) {
 		t.Fatalf("Check = %v, want ErrUnknownType", err)
+	}
+}
+
+// TestCheckIgnoresUnrelatedNegativeShadowBalance proves Check only validates
+// the keys the candidate record touches. A synced Moved authored elsewhere
+// legitimately leaves this node with a negative shadow balance at a location
+// it does not own (docs/limitations.md); that must never block an unrelated
+// local command against a key this node does own.
+func TestCheckIgnoresUnrelatedNegativeShadowBalance(t *testing.T) {
+	inv, store := newInv(t, "A")
+	// n2 authored a move crediting "A" (owned by this node) and debiting "Q"
+	// (owned by n2). Once merged, this node's projection carries Q: -4, a
+	// shadow entry for a location it does not own.
+	remote := eventlog.Record{
+		NodeID: "n2", Seq: 1, Clock: clock.HLC{Wall: 1, NodeID: "n2"},
+		Type: domain.TypeMoved, Payload: mustJSON(t, domain.Moved{SKU: "S", From: "Q", To: "A", Qty: 4}),
+	}
+	if _, err := store.Merge(context.Background(), []eventlog.Record{remote}, inv); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if got := inv.Balance("S", "Q"); got != -4 {
+		t.Fatalf("Balance(Q) = %d, want -4 (shadow entry)", got)
+	}
+	// A local command touching only "A" must succeed despite the unrelated
+	// negative shadow at "Q".
+	if err := inv.Receive(context.Background(), "S", "A", 1); err != nil {
+		t.Fatalf("Receive on unrelated key rejected because of shadow balance: %v", err)
 	}
 }
 
@@ -2277,16 +2349,46 @@ func (i *Inventory) Check(r eventlog.Record) error {
 	if err != nil {
 		return err
 	}
-	for k, v := range next {
-		if v < 0 {
+	// Only the keys this record touches are validated. A node's state can
+	// legitimately carry a negative balance at a location it does not own —
+	// the shadow of a Moved authored and validated elsewhere (see
+	// docs/limitations.md) — and that must never block a local command
+	// against an unrelated key.
+	for _, k := range touchedKeys(r) {
+		if v := next[k]; v < 0 {
 			return fmt.Errorf("%w: %s at %s would be %d", ErrNegativeBalance, k.SKU, k.Location, v)
 		}
 	}
 	return nil
 }
 
+// touchedKeys returns the balance keys r's Apply call can change. Errors are
+// ignored here because Apply above already decoded r successfully; an
+// unrecognized type would have failed there first.
+func touchedKeys(r eventlog.Record) []Key {
+	switch r.Type {
+	case TypeReceived:
+		ev, _ := decode[Received](r)
+		return []Key{{ev.SKU, ev.Location}}
+	case TypeIssued:
+		ev, _ := decode[Issued](r)
+		return []Key{{ev.SKU, ev.Location}}
+	case TypeMoved:
+		ev, _ := decode[Moved](r)
+		return []Key{{ev.SKU, ev.From}, {ev.SKU, ev.To}}
+	default:
+		return nil
+	}
+}
+
 // Project implements eventlog.Projector: it computes the next state but does
 // not publish it until the store's transaction has committed.
+//
+// It also observes r's clock. Project runs for every record this node ever
+// projects, local or synced in from a peer, which makes it the one place
+// guaranteed to see every timestamp the node learns about. Folding a peer's
+// HLC in here is what makes ADR 0003's promise true: after merging a
+// record with a future timestamp, this node's own next Now() sorts after it.
 func (i *Inventory) Project(r eventlog.Record) (func(), error) {
 	i.mu.RLock()
 	staged := i.state.Clone()
@@ -2296,6 +2398,7 @@ func (i *Inventory) Project(r eventlog.Record) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	i.clk.Observe(r.Clock)
 	return func() {
 		i.mu.Lock()
 		i.state = next
@@ -2707,6 +2810,47 @@ func TestDuplicateBatchIsANoOp(t *testing.T) {
 	}
 }
 
+// raceLog wraps a store and injects a local append right after Since has
+// already collected its results but before pushAndAck takes its version
+// snapshot for the Ack — reproducing a local write racing with a push.
+type raceLog struct {
+	*eventlog.Store
+	extra func()
+}
+
+func (r *raceLog) Since(ctx context.Context, vv eventlog.VersionVector) ([]eventlog.Record, error) {
+	recs, err := r.Store.Since(ctx, vv)
+	if r.extra != nil {
+		f := r.extra
+		r.extra = nil // race only once
+		f()
+	}
+	return recs, err
+}
+
+// TestPushAndAckDoesNotAcknowledgeRecordsAppendedAfterTheSnapshot: a local
+// append that lands between collecting records to send and acknowledging must
+// not be reflected in the Ack, since the peer never actually received it.
+func TestPushAndAckDoesNotAcknowledgeRecordsAppendedAfterTheSnapshot(t *testing.T) {
+	ctx := context.Background()
+	nodeStore, central := store(t, "n1"), store(t, "central")
+	appendN(t, nodeStore, 2)
+	node := &raceLog{Store: nodeStore, extra: func() { appendN(t, nodeStore, 1) }}
+
+	cc := serve(t, central, nil)
+	client := lfsync.NewClient(cc, node, nil, "central")
+	vv, err := client.SyncOnce(ctx)
+	if err != nil {
+		t.Fatalf("SyncOnce: %v", err)
+	}
+	if got := vv.Get("n1"); got != 2 {
+		t.Fatalf("acked version = %d, want 2 — the raced-in 3rd record was never sent", got)
+	}
+	if got, err := central.Version(ctx); err != nil || got.Get("n1") != 2 {
+		t.Fatalf("central holds n1:%d, want 2 — the raced-in record must not have been pushed", got.Get("n1"))
+	}
+}
+
 // TestCentralProjectsAGlobalSum shows why Merge takes a Projector.
 func TestCentralProjectsAGlobalSum(t *testing.T) {
 	ctx := context.Background()
@@ -2912,24 +3056,36 @@ func sendHello(ctx context.Context, log Log, s Stream) error {
 
 // pushAndAck sends everything the peer lacks, then an Ack meaning "that is all
 // from me".
+//
+// The version snapshot is taken *before* Since collects records, and records
+// above that snapshot are dropped from the batch. Without this, a local
+// append racing with the push could land between Since and Version and be
+// acknowledged to the peer despite never having been sent — the peer would
+// then believe it holds a record it does not.
 func pushAndAck(ctx context.Context, log Log, s Stream, peerVV eventlog.VersionVector) error {
+	vv, err := log.Version(ctx)
+	if err != nil {
+		return err
+	}
 	recs, err := log.Since(ctx, peerVV)
 	if err != nil {
 		return err
 	}
-	for start := 0; start < len(recs); start += batchSize {
-		end := min(start+batchSize, len(recs))
+	bounded := make([]eventlog.Record, 0, len(recs))
+	for _, r := range recs {
+		if r.Seq <= vv.Get(r.NodeID) {
+			bounded = append(bounded, r)
+		}
+	}
+	for start := 0; start < len(bounded); start += batchSize {
+		end := min(start+batchSize, len(bounded))
 		batch := &syncpb.Batch{Records: make([]*syncpb.Record, 0, end-start)}
-		for _, r := range recs[start:end] {
+		for _, r := range bounded[start:end] {
 			batch.Records = append(batch.Records, RecordToPB(r))
 		}
 		if err := s.Send(&syncpb.Frame{Body: &syncpb.Frame_Batch{Batch: batch}}); err != nil {
 			return fmt.Errorf("sync: send batch: %w", err)
 		}
-	}
-	vv, err := log.Version(ctx)
-	if err != nil {
-		return err
 	}
 	if err := s.Send(&syncpb.Frame{Body: &syncpb.Frame_Ack{Ack: &syncpb.Ack{Version: VersionToPB(vv)}}}); err != nil {
 		return fmt.Errorf("sync: send ack: %w", err)
@@ -3005,6 +3161,9 @@ package sync
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
@@ -3030,6 +3189,13 @@ func NewClient(cc grpc.ClientConnInterface, log Log, p eventlog.Projector, peer 
 // SyncOnce runs one exchange and, on success, advances the peer cursor to the
 // highest own-record sequence the peer now holds. On failure the cursor is left
 // untouched: the node stays fully operational and simply retries.
+//
+// Sending our final Ack only closes our send side — it says nothing about
+// whether the responder finished applying our batches. After CloseSend, the
+// responder is still merging the last batch server-side; its Merge error (if
+// any) only surfaces as this stream's terminal RPC status. We must read that
+// status before advancing the cursor, or a failed remote merge would be
+// recorded as a successful sync.
 func (c *Client) SyncOnce(ctx context.Context) (eventlog.VersionVector, error) {
 	stream, err := c.rpc.Replicate(ctx)
 	if err != nil {
@@ -3041,6 +3207,9 @@ func (c *Client) SyncOnce(ctx context.Context) (eventlog.VersionVector, error) {
 	}
 	if err := stream.CloseSend(); err != nil {
 		return nil, err
+	}
+	if _, err := stream.Recv(); err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("sync: responder: %w", err)
 	}
 	if err := c.log.SetCursor(ctx, c.peer, vv.Get(c.log.NodeID())); err != nil {
 		return nil, err
@@ -3096,6 +3265,33 @@ func TestLargeLogIsSentInMultipleFrames(t *testing.T) {
 	}
 	if len(recs) != 150 {
 		t.Fatalf("central holds %d records, want 150", len(recs))
+	}
+}
+
+// failMergeLog wraps a store and makes every Merge fail, simulating a
+// responder that rejects the initiator's final batch.
+type failMergeLog struct{ *eventlog.Store }
+
+func (failMergeLog) Merge(context.Context, []eventlog.Record, eventlog.Projector) (int, error) {
+	return 0, errors.New("responder: merge exploded")
+}
+
+// TestSyncOnceFailsWhenTheResponderMergeFails proves the client waits for the
+// responder's terminal RPC status instead of declaring success right after
+// sending its own final Ack: the responder's Merge error must surface here,
+// and the cursor must stay untouched.
+func TestSyncOnceFailsWhenTheResponderMergeFails(t *testing.T) {
+	ctx := context.Background()
+	node, centralStore := store(t, "n1"), store(t, "central")
+	appendN(t, node, 2)
+
+	cc := serve(t, failMergeLog{centralStore}, nil)
+	client := lfsync.NewClient(cc, node, nil, "central")
+	if _, err := client.SyncOnce(ctx); err == nil {
+		t.Fatal("SyncOnce must fail when the responder's merge fails")
+	}
+	if cur, err := node.Cursor(ctx, "central"); err != nil || cur != 0 {
+		t.Fatalf("cursor = (%d, %v), want (0, nil) — a failed sync must not advance it", cur, err)
 	}
 }
 ```
@@ -5664,7 +5860,13 @@ type List struct {
 	store *eventlog.Store
 	clk   *clock.Clock
 
-	mu    sync.Mutex
+	// mu guards state itself, independently of anything that guards calling
+	// Store.Append. A background eventlog.Merge (a synced record arriving from
+	// another node) calls Check and Project through this same Validator/
+	// Projector seam, concurrently with a local command — so the state access
+	// inside Check and Project must defend itself, exactly like
+	// domain.Inventory does with its own mu.
+	mu    sync.RWMutex
 	state State
 }
 
@@ -5681,7 +5883,10 @@ func NewList(ctx context.Context, store *eventlog.Store, clk *clock.Clock) (*Lis
 // transaction. "Would my reducer accept this?" is the whole invariant, so the
 // rules live in exactly one place.
 func (l *List) Check(r eventlog.Record) error {
-	_, err := Reducer{}.Apply(l.state, r)
+	l.mu.RLock()
+	trial := l.state
+	l.mu.RUnlock()
+	_, err := Reducer{}.Apply(trial, r)
 	return err
 }
 
@@ -5689,11 +5894,18 @@ func (l *List) Check(r eventlog.Record) error {
 // closure the store runs only after the transaction commits. If the commit
 // fails, l.state is untouched.
 func (l *List) Project(r eventlog.Record) (func(), error) {
-	next, err := Reducer{}.Apply(l.state, r)
+	l.mu.RLock()
+	trial := l.state
+	l.mu.RUnlock()
+	next, err := Reducer{}.Apply(trial, r)
 	if err != nil {
 		return nil, err
 	}
-	return func() { l.state = next }, nil
+	return func() {
+		l.mu.Lock()
+		l.state = next
+		l.mu.Unlock()
+	}, nil
 }
 
 // Add appends a tasklist.Added. Note the shape of a command in this
@@ -5715,21 +5927,23 @@ func (l *List) Complete(ctx context.Context, id string) error {
 	return l.append(ctx, TypeCompleted, Completed{ID: id})
 }
 
+// append does not hold l.mu around Store.Append: Check and Project already
+// guard their own access to l.state, and Store.Append calls them
+// synchronously inside its own transaction lock (Task 4). Wrapping this call
+// in l.mu too would only add a second lock with no correctness benefit.
 func (l *List) append(ctx context.Context, typ string, event any) error {
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("tasklist: encode %s: %w", typ, err)
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	_, err = l.store.Append(ctx, typ, payload, l.clk.Now(), l, l)
 	return err
 }
 
 // Tasks returns a snapshot of projected state.
 func (l *List) Tasks() State {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.state.Clone()
 }
 ```
@@ -5916,18 +6130,28 @@ append transaction against current projected state. Because every rule is in
 // Check is eventlog.Validator: the store calls it inside the append
 // transaction.
 func (l *List) Check(r eventlog.Record) error {
-	_, err := Reducer{}.Apply(l.state, r)
+	l.mu.RLock()
+	trial := l.state
+	l.mu.RUnlock()
+	_, err := Reducer{}.Apply(trial, r)
 	return err
 }
 
 // Project is eventlog.Projector: compute the next state, and hand back a
 // closure the store runs only after the transaction commits.
 func (l *List) Project(r eventlog.Record) (func(), error) {
-	next, err := Reducer{}.Apply(l.state, r)
+	l.mu.RLock()
+	trial := l.state
+	l.mu.RUnlock()
+	next, err := Reducer{}.Apply(trial, r)
 	if err != nil {
 		return nil, err
 	}
-	return func() { l.state = next }, nil
+	return func() {
+		l.mu.Lock()
+		l.state = next
+		l.mu.Unlock()
+	}, nil
 }
 ```
 
@@ -5935,6 +6159,12 @@ func (l *List) Project(r eventlog.Record) (func(), error) {
 same thing for negative balances. The deferred `commit func()` is why a
 transaction that fails to commit cannot leave the in-memory projection ahead of
 the log.
+
+Note the lock is `l.mu`, held only inside `Check` and `Project` themselves —
+not around the call to `Store.Append`. A background `eventlog.Merge` (a record
+synced in from another node) calls `Check`/`Project` through this same seam,
+concurrently with a local command, so the state access has to defend itself
+rather than rely on whatever lock the caller happens to hold.
 
 ## Step 5 — write the command encoder
 
@@ -5969,8 +6199,6 @@ func (l *List) append(ctx context.Context, typ string, event any) error {
 	if err != nil {
 		return fmt.Errorf("tasklist: encode %s: %w", typ, err)
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	_, err = l.store.Append(ctx, typ, payload, l.clk.Now(), l, l)
 	return err
 }
@@ -5978,7 +6206,10 @@ func (l *List) append(ctx context.Context, typ string, event any) error {
 
 `store.Append(ctx, typ, payload, ts, validator, projector)` is the only engine
 call a command makes. Passing `l` twice is not a trick — `List` satisfies both
-interfaces, which is the natural result of keeping the rules in one place.
+interfaces, which is the natural result of keeping the rules in one place. Note
+`append` does not take `l.mu` itself: `Check` and `Project` already guard their
+own reads and writes of `l.state`, so a second lock around `Append` would add
+nothing but a chance to deadlock against a concurrent `Merge`.
 
 ## Step 6 — the swap is done
 

@@ -20,7 +20,7 @@ You do not need prior CRDT knowledge. Four ideas carry the whole project:
 
 4. **Hybrid Logical Clock (HLC).** Wall-clock timestamps alone break LWW: a node with a clock 10 minutes fast wins every conflict forever. An HLC is `{Wall, Logical, NodeID}`. `Wall` is unix millis, `Logical` is a tiebreak counter, `NodeID` breaks remaining ties so the order is total. Crucially, when a node *receives* a remote event, it calls `Observe(remoteHLC)`, which pulls its own clock up to at least the remote's. That means any write a node makes *after* seeing your event is guaranteed to sort after your event — causality is preserved even with drifting clocks.
 
-5. **Version vector.** A map `NodeID -> highest Seq of that node's events I hold`. Comparing two version vectors tells each side exactly what to send. `A dominates B` means A holds everything B holds.
+5. **Version vector.** A map `NodeID -> highest Seq of a gap-free run of that node's events I hold, starting from 1` (not a raw highest-seq -- see Task 4's `versionVectorQuery`; a raw max would lie about coverage under reordered delivery). Comparing two version vectors tells each side exactly what to send. `A dominates B` means A holds everything B holds.
 
 ## Global Constraints
 
@@ -66,7 +66,7 @@ All paths relative to `eventlog-lab/`.
 | `internal/jepsenlite/schedule.go` | Seeded op + fault schedule generation. |
 | `internal/jepsenlite/harness.go` | Run to quiescence, check the three properties, report. |
 | `internal/jepsenlite/*_test.go` | Seeded runs; targeted non-random tests. |
-| `cmd/lab/main.go` | `lab node|op|state|sim`. |
+| `cmd/lab/main.go` | `lab node\|op\|state\|sim`. |
 
 ---
 
@@ -178,7 +178,10 @@ Expected: FAIL — build error, `undefined: HLC`.
 // reaches the same verdict on which of two writes is later, with no ties.
 package clock
 
-import "cmp"
+import (
+	"cmp"
+	"math"
+)
 
 // NodeID identifies a replica. It is the final tiebreak in HLC ordering, so it
 // must be stable for the lifetime of a node's data.
@@ -352,6 +355,12 @@ func TestClockObserve(t *testing.T) {
 			remote: HLC{Wall: 100, Logical: 7, NodeID: "B"},
 			want:   HLC{Wall: 100, Logical: 8, NodeID: "A"},
 		},
+		{
+			name:   "remote logical at max uint32 advances wall instead of wrapping",
+			wall:   100,
+			remote: HLC{Wall: 100, Logical: math.MaxUint32, NodeID: "B"},
+			want:   HLC{Wall: 101, Logical: 0, NodeID: "A"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -383,7 +392,7 @@ func TestClockDefaultWallUsesRealTime(t *testing.T) {
 }
 ```
 
-Add `"time"` to the test file's imports.
+Add `"math"` and `"time"` to the test file's imports.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -442,14 +451,30 @@ func (c *Clock) Last() HLC {
 
 // tick advances the clock past both c.last and floor, using the wall reading
 // when it is ahead of both. Caller holds c.mu.
+//
+// bumpLogical advances past prior's Logical counter. If prior.Logical is
+// already math.MaxUint32, incrementing would wrap to 0 and sort *before*
+// prior, breaking monotonicity -- so instead it advances Wall by one
+// millisecond and resets Logical to 0, which still sorts after prior under
+// the total order (Wall, Logical, NodeID).
+func bumpLogical(next HLC, prior HLC) HLC {
+	if prior.Logical == math.MaxUint32 {
+		next.Wall = prior.Wall + 1
+		next.Logical = 0
+		return next
+	}
+	next.Wall = prior.Wall
+	next.Logical = prior.Logical + 1
+	return next
+}
+
 func (c *Clock) tick(floor HLC) HLC {
 	next := HLC{Wall: c.wall(), NodeID: c.id}
 	for _, prior := range [...]HLC{c.last, floor} {
 		if next.Wall < prior.Wall {
-			next.Wall = prior.Wall
-			next.Logical = prior.Logical + 1
+			next = bumpLogical(next, prior)
 		} else if next.Wall == prior.Wall && next.Logical <= prior.Logical {
-			next.Logical = prior.Logical + 1
+			next = bumpLogical(next, prior)
 		}
 	}
 	c.last = next
@@ -513,6 +538,7 @@ Pure data and pure functions. No storage yet — this task exists separately bec
 
 **Domain notes for the implementer:**
 - `EventID` is `{NodeID, Seq}`. A node numbers its own events 1, 2, 3, … so IDs are globally unique with no UUIDs and no coordination. A gap-free per-node sequence is also what lets a version vector be a single number per node.
+- **Contract `VersionVector` depends on:** `Contains`/`Dominates` treat `A:2` as proof that `A:1..2` are both held. That is only sound if `A:2` being *stored* really does imply `A:1` is stored too -- and the harness's `Reorder` fault (Task 11) permutes whole `Events` batches, which can each contain events from more than one origin interleaved by HLC order, so `A:1` and `A:2` can legitimately land in different batches that arrive out of order. A raw `MAX(seq)` per node would then be simply wrong: it would report `A` as covered through 2 when `A:1` was never received, and any peer computing what to send this replica would believe `A:1` is already here and never send it -- exactly the "lost forever" bug. The fix lives in `eventlog/log.go`'s `versionVectorQuery` (Task 4): `VersionVector` reports the highest **gap-free contiguous prefix** per node (computed via a "gaps and islands" `ROW_NUMBER()` query), not a raw `MAX(seq)`. A node with a gap right after its prefix is reported at the lower, correct frontier; the vector only advances once the gap-filling event arrives, which it eventually does since `Reorder` delays frames rather than dropping them. The `VersionVector` map shape, `Contains`, `Dominates`, `Observe`, and `Merge` are all unchanged -- only the *query* that populates the map changed, so this is a minimal fix, not a new data structure.
 - `KindQuantityDelta` carries a **signed delta**, never an absolute quantity. `Delta: -3` means "three were picked". Deltas commute; absolute values do not — two nodes setting `Quantity = 7` and `Quantity = 4` concurrently have no correct merge, whereas `-3` and `-4` obviously sum.
 - `Validate` is the trust boundary for remote events. The spec is explicit: *never persist an event the local `crdt` package cannot apply*, or convergence breaks silently. Reject unknown kinds, empty SKUs, zero `Seq`, empty `NodeID`, and kind/field mismatches.
 
@@ -742,6 +768,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
 )
@@ -840,13 +867,26 @@ func (e Event) Validate() error {
 	case !e.Kind.Valid():
 		return fmt.Errorf("%w: unknown kind %d", ErrMalformedEvent, e.Kind)
 	}
+	// Every payload field belongs to exactly one kind. Reject any field set on
+	// a kind it doesn't belong to, not just Delta -- Apply silently ignores
+	// fields that don't match e.Kind, so an accepted-but-mismatched event
+	// would persist data that never takes effect anywhere.
 	if e.Kind != KindQuantityDelta && e.Delta != 0 {
 		return fmt.Errorf("%w: delta set on kind %d", ErrMalformedEvent, e.Kind)
+	}
+	if e.Kind != KindMetaSet && e.Meta != nil {
+		return fmt.Errorf("%w: meta set on kind %d", ErrMalformedEvent, e.Kind)
+	}
+	if e.Kind != KindDeleteSet && e.DeletedTo != nil {
+		return fmt.Errorf("%w: deletedTo set on kind %d", ErrMalformedEvent, e.Kind)
 	}
 	switch e.Kind {
 	case KindQuantityDelta:
 		if e.Delta == 0 {
 			return fmt.Errorf("%w: zero quantity delta", ErrMalformedEvent)
+		}
+		if e.Delta == math.MinInt64 {
+			return fmt.Errorf("%w: delta %d has no representable magnitude", ErrMalformedEvent, e.Delta)
 		}
 	case KindMetaSet:
 		if e.Meta.Empty() {
@@ -1103,6 +1143,44 @@ func TestAppendLocalAllocatesGapFreeSeq(t *testing.T) {
 	}
 }
 
+// TestVersionVectorReportsContiguousPrefixNotRawMax is a regression test for
+// reordered delivery: if node A's event 2 is stored before its event 1 (the
+// harness's Reorder fault can produce exactly this, since a single Events
+// batch can interleave more than one origin), VersionVector must not report
+// A as covered through 2 -- that would make Contains(A:1) lie, and a peer
+// deciding what to send this replica would never send A:1 again.
+func TestVersionVectorReportsContiguousPrefixNotRawMax(t *testing.T) {
+	ctx := context.Background()
+	l := newTestLog(t)
+
+	// Seq 2 arrives and is stored; seq 1 has not arrived yet.
+	if err := l.Append(ctx, qty("A", 2, 100, "SKU-1", 1)); err != nil {
+		t.Fatalf("Append(A:2) error = %v", err)
+	}
+	vv, err := l.VersionVector(ctx)
+	if err != nil {
+		t.Fatalf("VersionVector() error = %v", err)
+	}
+	if got, ok := vv["A"]; ok {
+		t.Fatalf(`vv["A"] = %d, want absent -- A:1 is missing, so nothing is covered yet`, got)
+	}
+	if got := vv.Contains(EventID{NodeID: "A", Seq: 1}); got {
+		t.Fatal("Contains(A:1) = true before A:1 ever arrived -- a peer would wrongly believe it was already delivered")
+	}
+
+	// Seq 1 arrives late; the gap closes and the vector advances.
+	if err := l.Append(ctx, qty("A", 1, 100, "SKU-1", 1)); err != nil {
+		t.Fatalf("Append(A:1) error = %v", err)
+	}
+	vv, err = l.VersionVector(ctx)
+	if err != nil {
+		t.Fatalf("VersionVector() error = %v", err)
+	}
+	if vv["A"] != 2 {
+		t.Fatalf(`vv["A"] = %d, want 2 once the gap is filled`, vv["A"])
+	}
+}
+
 func TestAppendLocalRejectsMalformedWithoutBurningSeq(t *testing.T) {
 	ctx := context.Background()
 	l := newTestLog(t)
@@ -1347,7 +1425,20 @@ type Log interface {
 	// Since streams every held event not covered by vv, in HLC order.
 	Since(ctx context.Context, vv VersionVector) iter.Seq2[Event, error]
 
-	// VersionVector reports the highest Seq held per node.
+	// VersionVector reports, per node, the highest Seq N such that every
+	// event 1..N from that node is held -- a gap-free contiguous prefix, NOT
+	// a raw MAX(seq). This matters under reordered delivery: if a node's
+	// event 2 is stored before its event 1 (the harness's Reorder fault
+	// permutes whole Events batches, which can interleave more than one
+	// origin, so this is reachable even though a single batch's own events
+	// are never reordered relative to each other), a raw MAX(seq) would
+	// report that node's contribution as "covered through 2" while event 1
+	// was never actually received -- Contains(id1) would then lie, a peer
+	// computing what to send us would believe we already have it, and it
+	// would never be sent again. Computing the contiguous prefix instead
+	// means a gap simply doesn't advance the vector past it; the gap-filling
+	// event, whenever it eventually arrives (Reorder delays, it does not
+	// drop), closes it and the vector advances then.
 	VersionVector(ctx context.Context) (VersionVector, error)
 
 	// LoadSnapshot returns the serialized state for sku and the version
@@ -1400,6 +1491,25 @@ CREATE TABLE IF NOT EXISTS sync_cursors (
 `
 
 const selectEvents = `SELECT node_id, seq, hlc_wall, hlc_logical, sku, kind, payload FROM events`
+
+// versionVectorQuery computes, per node_id, the highest seq in the
+// gap-free run starting at 1 -- NOT a raw MAX(seq). "seq - ROW_NUMBER()"
+// is constant within a contiguous run of seqs and only equals 0 for the run
+// that starts at seq 1; GROUP BY that expression and keep the grp-0 group's
+// max. A node with a gap right after seq 1 (or missing seq 1 entirely) is
+// correctly reported with a lower frontier, or omitted if it has no seq 1
+// yet -- both ROW_NUMBER() OVER and this style of "gaps and islands" query
+// work identically in SQLite (3.25+, already required for iter.Seq2) and
+// Postgres, so this text is shared verbatim by both backends.
+const versionVectorQuery = `
+SELECT node_id, MAX(seq) AS frontier
+FROM (
+  SELECT node_id, seq,
+         seq - ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY seq) AS grp
+  FROM events
+) contiguous
+WHERE grp = 0
+GROUP BY node_id`
 ```
 
 - [ ] **Step 5: Write the SQLite implementation**
@@ -1587,7 +1697,7 @@ func scanEvent(s scanner) (Event, error) {
 
 // VersionVector reports the highest Seq held per node.
 func (l *SQLiteLog) VersionVector(ctx context.Context) (VersionVector, error) {
-	rows, err := l.db.QueryContext(ctx, `SELECT node_id, MAX(seq) FROM events GROUP BY node_id`)
+	rows, err := l.db.QueryContext(ctx, versionVectorQuery)
 	if err != nil {
 		return nil, fmt.Errorf("query version vector: %w", err)
 	}
@@ -1609,7 +1719,12 @@ func (l *SQLiteLog) VersionVector(ctx context.Context) (VersionVector, error) {
 	return vv, nil
 }
 
-// Cursor returns the highest Seq of peer's events we have applied.
+// Cursor returns the highest Seq of peer's OWN events we last saw it ack.
+// This is a diagnostic value for regression detection only (see
+// sync.warnOnRegression) -- it is never consulted to decide what a session
+// exchanges. That decision always uses a freshly computed, full
+// VersionVector on both sides, so a single scalar here is sufficient even
+// though a log can hold events relayed from many origins.
 func (l *SQLiteLog) Cursor(ctx context.Context, peer clock.NodeID) (Seq, error) {
 	var last int64
 	err := l.db.QueryRowContext(ctx,
@@ -2100,6 +2215,11 @@ func NewItemState() *ItemState {
 func (s *ItemState) Apply(e eventlog.Event) {
 	switch e.Kind {
 	case eventlog.KindQuantityDelta:
+		// -e.Delta below would overflow if e.Delta == math.MinInt64 (its
+		// magnitude does not fit in int64). eventlog.Event.Validate rejects
+		// that value at the trust boundary before any event reaches here, on
+		// both the local-write path and the remote-frame path, so this
+		// negation is safe by construction rather than by luck.
 		if e.Delta >= 0 {
 			s.Pos[e.ID.NodeID] += e.Delta
 		} else {
@@ -2911,7 +3031,7 @@ git commit -m "feat(eventlog): snapshots, safe compaction, and the projection re
   - `func (n *Node) SetMeta(ctx context.Context, sku string, name *string, reorderPoint *int64) (eventlog.EventID, error)`
   - `func (n *Node) Delete(ctx context.Context, sku string, deleted bool) (eventlog.EventID, error)`
   - `func (n *Node) Get(ctx context.Context, sku string) (*crdt.ItemState, error)`
-  - `func (n *Node) Merge(ctx context.Context, events []eventlog.Event) (int, error)` — appends remote events, calls `clock.Observe` for each, returns how many were accepted; skips and reports malformed ones without aborting the batch.
+  - `func (n *Node) Merge(ctx context.Context, events []eventlog.Event) (int, error)` — appends remote events, calls `clock.Observe` for each, returns how many were accepted; skips and reports malformed ones without aborting the batch. When the underlying log is a Postgres central store (detected via an optional `projectionSink` interface, added in Task 10 — not a hard dependency on the `eventlog` Postgres type), also re-projects and upserts the affected SKU's reporting row on every accepted event, so `Anomalies()` never goes stale after replication.
   - `func (n *Node) VersionVector(ctx context.Context) (eventlog.VersionVector, error)`
 
 **Domain notes for the implementer:**
@@ -3352,8 +3472,31 @@ func (n *Node) Merge(ctx context.Context, events []eventlog.Event) (int, error) 
 		if err := n.projector.MaybeSnapshot(ctx, e.SKU); err != nil {
 			return accepted, fmt.Errorf("node %q merge: %w", n.id, err)
 		}
+		// The reporting projection (Postgres central only) must stay
+		// synchronized with every merge, not just local writes -- otherwise
+		// Anomalies() reads stale or empty data after replication, which is
+		// exactly the gap a merge-only central store must not have. n.log is
+		// an ordinary eventlog.Log everywhere except central, so this is an
+		// optional capability check, not a Postgres import here.
+		if sink, ok := n.log.(projectionSink); ok {
+			state, err := n.projector.Project(ctx, e.SKU)
+			if err != nil {
+				return accepted, fmt.Errorf("node %q merge: project %q: %w", n.id, e.SKU, err)
+			}
+			if err := sink.UpsertProjection(ctx, e.SKU, state.Quantity(),
+				state.Name.Value, state.ReorderPoint.Value, state.Deleted.Value); err != nil {
+				return accepted, fmt.Errorf("node %q merge: upsert projection %q: %w", n.id, e.SKU, err)
+			}
+		}
 	}
 	return accepted, nil
+}
+
+// projectionSink is satisfied by eventlog.PostgresLog and nothing else in
+// this codebase; it lets Merge keep the central reporting projection current
+// without node importing eventlog.PostgresLog or Postgres-specific types.
+type projectionSink interface {
+	UpsertProjection(ctx context.Context, sku string, quantity int64, name string, reorderPoint int64, deleted bool) error
 }
 
 // Get returns the merged state for sku.
@@ -4028,13 +4171,16 @@ func TestSyncToleratesPeerVersionVectorRegression(t *testing.T) {
 	}
 	syncPair(t, a, b, 8)
 
-	// B forgets everything it learned; its Welcome now regresses below the
-	// cursor A holds. A must re-send from the lower point, and idempotent
+	// B forgets everything it learned by coming back with an empty log under
+	// the SAME peer identity "B" -- reusing the identity is what makes this a
+	// genuine regression instead of a first-ever sync. A already has a
+	// cursor for "B" recording seq 3 from the sync above; a brand-new peer
+	// id (e.g. "B2") would have no prior cursor at all, and warnOnRegression
+	// would never fire because there is nothing to regress from. With the
+	// same identity, B's fresh Welcome reports vv={} -- below the cursor A
+	// holds -- so A must re-send from the lower point, and idempotent
 	// Append must absorb it.
-	if _, err := b.Log().(*eventlog.SQLiteLog).VersionVector(ctx); err != nil {
-		t.Fatalf("VersionVector() error = %v", err)
-	}
-	forgetful := newNode(t, "B2")
+	forgetful := newNode(t, "B")
 	rep := syncPair(t, a, forgetful, 8)
 	if rep.Sent != 3 {
 		t.Fatalf("re-send after regression Sent = %d, want 3", rep.Sent)
@@ -4962,8 +5108,9 @@ git commit -m "feat(sync): session state machine over gRPC and in-memory transpo
 **Domain notes for the implementer:**
 - Central is a **merge participant, not an authority**. It has no rejection path: it runs the same `sync.Server` code, the same `node.Node`, and the same `crdt.Apply` as every other replica. The *only* thing it has extra is a reporting projection table.
 - Negative quantity is the anomaly the projection reports. Central does not and must not refuse the events that produced it. Rejection lives in a different project (`warehouse-node`); documenting the limitation honestly is the deliverable here.
+- `UpsertProjection` must not be something only tests call. `node.Node.Merge` (Task 7) type-asserts its log against a small `projectionSink` interface and calls `UpsertProjection` for every accepted event's SKU, so the reporting projection — and therefore `Anomalies()` — reflects every central merge automatically, not just whatever a test manually projected. Revisit `node/node.go`'s `Merge` after this task exists if it was implemented before this file, per the Global Constraint that later tasks may need to circle back and patch earlier ones for cross-cutting concerns like this.
 - Postgres uses `$1` placeholders, not `?`, and `BYTEA` rather than `BLOB` — so the schema text and the SQL cannot literally be shared with SQLite. Keep the *column definitions identical* to the spec's schema so the two backends cannot drift semantically.
-- These tests require a live Postgres. Gate them on an env var and **skip cleanly when absent** — but note the Global Constraint that no task concludes with skipped tests: run them at least once against a real database (`docker run --rm -e POSTGRES_PASSWORD=pg -p 5432:5432 postgres:16`) and record the passing output before committing.
+- These tests require a live Postgres. The Global Constraint that no task concludes with skipped tests means a runtime `t.Skip` inside the default `go test ./...` suite is not acceptable — a CI run with no DSN set would silently "pass" a gate that never ran. Instead, `postgres_test.go` carries a `//go:build integration` tag, which removes it from the default build and test gate entirely (it is not "skipped," it does not exist in that build). It is a separate, explicitly required gate: `go test -tags=integration ./eventlog/ -run TestPostgres -v` against a real database (`docker run --rm -e POSTGRES_PASSWORD=pg -p 5432:5432 postgres:16`, DSN in `EVENTLOG_LAB_PG_DSN`). Run and record passing output for this gate before committing this task, in addition to the default `go test ./... -cover` gate.
 
 - [ ] **Step 1: Add the driver**
 
@@ -4984,23 +5131,32 @@ export EVENTLOG_LAB_PG_DSN='postgres://postgres:pg@127.0.0.1:5432/postgres?sslmo
 `eventlog-lab/eventlog/postgres_test.go`:
 
 ```go
+//go:build integration
+
+// This file is excluded from the default `go test ./...` gate by the
+// integration build tag -- it is a separate, explicitly required gate, not a
+// task allowed to skip. Run it with:
+//   go test -tags=integration ./eventlog/ -run TestPostgres -v
+// against a live Postgres (EVENTLOG_LAB_PG_DSN set). See Task 10 domain notes.
 package eventlog
 
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
 )
 
-// newPGLog returns a Postgres log with empty tables, or skips when no DSN is
-// configured. Run these at least once against a real database -- see the plan.
+// newPGLog returns a Postgres log with empty tables. EVENTLOG_LAB_PG_DSN must
+// be set -- this file only builds under -tags=integration, so there is no
+// silent-skip path: a missing DSN is a hard test failure, not a skip.
 func newPGLog(t *testing.T) *PostgresLog {
 	t.Helper()
 	dsn := os.Getenv("EVENTLOG_LAB_PG_DSN")
 	if dsn == "" {
-		t.Skip("EVENTLOG_LAB_PG_DSN not set; start Postgres and export it")
+		t.Fatal("EVENTLOG_LAB_PG_DSN not set; start Postgres and export it (see Task 10)")
 	}
 	ctx := context.Background()
 	l, err := OpenPostgres(ctx, dsn)
@@ -5147,6 +5303,49 @@ func TestPostgresOpenRejectsBadDSN(t *testing.T) {
 	}
 }
 
+// TestPostgresAppendLocalSerializesConcurrentSeqAllocation guards the
+// pg_advisory_xact_lock fix: without it, concurrent AppendLocal calls for the
+// same node can silently drop an event under ON CONFLICT DO NOTHING.
+func TestPostgresAppendLocalSerializesConcurrentSeqAllocation(t *testing.T) {
+	ctx := context.Background()
+	l := newPGLog(t)
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = l.AppendLocal(ctx, func(s Seq) Event {
+				return qty("A", s, int64(1000+i), "SKU-1", 1)
+			})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("AppendLocal() goroutine %d error = %v", i, err)
+		}
+	}
+
+	seqs := map[Seq]bool{}
+	count := 0
+	for e, err := range l.Since(ctx, VersionVector{}) {
+		if err != nil {
+			t.Fatalf("Since() error = %v", err)
+		}
+		if seqs[e.ID.Seq] {
+			t.Fatalf("seq %d allocated to more than one event -- lost a concurrent append", e.ID.Seq)
+		}
+		seqs[e.ID.Seq] = true
+		count++
+	}
+	if count != n {
+		t.Fatalf("stored %d events, want %d -- a concurrent append was silently dropped", count, n)
+	}
+}
+
 func TestPostgresAnomaliesReportNegativeStockWithoutRejectingIt(t *testing.T) {
 	ctx := context.Background()
 	l := newPGLog(t)
@@ -5190,8 +5389,8 @@ Add `"github.com/dhiazfathra/local-first-architecture/eventlog-lab/crdt"` to the
 
 - [ ] **Step 4: Run the tests to verify they fail**
 
-Run: `cd eventlog-lab && go test ./eventlog/ -run TestPostgres -v`
-Expected: FAIL — `undefined: OpenPostgres`.
+Run: `cd eventlog-lab && go test -tags=integration ./eventlog/ -run TestPostgres -v`
+Expected: FAIL — `undefined: OpenPostgres`. (Without `-tags=integration` this file is not compiled at all and `go test ./...` shows no `TestPostgres*` tests — that is expected, not a skip.)
 
 - [ ] **Step 5: Write the implementation**
 
@@ -5310,6 +5509,17 @@ func (l *PostgresLog) Append(ctx context.Context, e Event) error {
 
 // AppendLocal allocates and inserts in one transaction, so no crash can leave a
 // sequence gap.
+//
+// SQLite's single writer connection makes MAX(seq)+1 safe by accident; the
+// Postgres connection pool does not serialize concurrent transactions the
+// same way. Without a lock, two concurrent AppendLocal calls for the same
+// node_id can both read the same MAX(seq), both compute the same next value,
+// and both proceed to insert -- one insert wins, the other's ON CONFLICT DO
+// NOTHING silently no-ops, and that caller believes its (distinct!) event
+// was appended when nothing was written for it. pg_advisory_xact_lock keyed
+// by node_id serializes exactly the callers that would collide, without
+// taking a table-wide lock, and releases automatically on commit or
+// rollback -- no separate unlock call needed.
 func (l *PostgresLog) AppendLocal(ctx context.Context, mint func(Seq) Event) (Event, error) {
 	tx, err := l.pool.Begin(ctx)
 	if err != nil {
@@ -5318,6 +5528,10 @@ func (l *PostgresLog) AppendLocal(ctx context.Context, mint func(Seq) Event) (Ev
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	probe := mint(0)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`,
+		string(probe.ID.NodeID)); err != nil {
+		return Event{}, fmt.Errorf("lock seq allocator for %q: %w", probe.ID.NodeID, err)
+	}
 	var next int64
 	if err := tx.QueryRow(ctx,
 		`SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE node_id = $1`,
@@ -5392,7 +5606,7 @@ func (l *PostgresLog) CountForSKU(ctx context.Context, sku string) (int, error) 
 
 // VersionVector reports the highest seq held per node.
 func (l *PostgresLog) VersionVector(ctx context.Context) (VersionVector, error) {
-	rows, err := l.pool.Query(ctx, `SELECT node_id, MAX(seq) FROM events GROUP BY node_id`)
+	rows, err := l.pool.Query(ctx, versionVectorQuery)
 	if err != nil {
 		return nil, fmt.Errorf("query version vector: %w", err)
 	}
@@ -5581,12 +5795,12 @@ func (l *PostgresLog) UpsertProjection(ctx context.Context, sku string,
 
 with the body using those parameters directly, and drop the `crdt` import. In the test, call it as
 `l.UpsertProjection(ctx, sku, state.Quantity(), state.Name.Value, state.ReorderPoint.Value, state.Deleted.Value)`.
-The anomaly test then belongs in `crdt/central_test.go` (package `crdt`), since it needs both packages.
+The anomaly test then belongs in `crdt/central_test.go` (package `crdt`), carrying the same `//go:build integration` tag as `postgres_test.go` for the same reason: it needs a live Postgres and must not be part of the default skip-free gate.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `cd eventlog-lab && go test ./eventlog/ ./crdt/ -run 'Postgres|Anomal' -v`
-Expected: PASS with `EVENTLOG_LAB_PG_DSN` exported. Record the output — this is the "ran at least once against a real database" evidence the Global Constraints require.
+Run: `cd eventlog-lab && go test -tags=integration ./eventlog/ ./crdt/ -run 'Postgres|Anomal' -v`
+Expected: PASS with `EVENTLOG_LAB_PG_DSN` exported. Record the output — this is the separate, explicitly required integration gate (see Task 10 domain notes); it runs in addition to, never instead of, the default `go test ./... -cover` gate, which contains no Postgres tests to skip.
 
 - [ ] **Step 7: Write the README**
 
@@ -5607,8 +5821,11 @@ A property-based harness partitions nodes, skews clocks, duplicates and reorders
 deliveries, and crashes nodes mid-append, then asserts:
 
 1. **Convergence** — nodes that exchanged the same event set compute identical state.
-2. **No lost event** — every event durably acknowledged to a caller appears in
-   every replica's log after sync.
+2. **No lost event** — every event durably acknowledged to a caller is reflected
+   in every replica's projected state after sync, before compaction is ever
+   allowed to discard its row. Compaction may later delete the row once every
+   peer has acked past it and a snapshot already folds it in; that does not
+   lose the event's effect.
 3. **Order independence** — replaying a merged log in any causally-valid order
    yields identical state.
 
@@ -5753,6 +5970,12 @@ func helloFrame() *syncpb.ClientFrame {
 	}}
 }
 
+func ackFrame() *syncpb.ClientFrame {
+	return &syncpb.ClientFrame{Body: &syncpb.ClientFrame_Ack{
+		Ack: &syncpb.Ack{},
+	}}
+}
+
 func TestParseFaults(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -5888,6 +6111,31 @@ func TestInjectorReorderHoldsOneEventsFrameThenReleasesBoth(t *testing.T) {
 	}
 	if got := in.Stats().Reordered; got == 0 {
 		t.Errorf("Stats().Reordered = 0, want > 0")
+	}
+}
+
+// TestInjectorReorderFlushesHeldFrameBeforeAck is a regression test: a held
+// Events frame used to only flush when the NEXT frame was also Events. In
+// practice the frame after a session's final Events batch is an Ack, and the
+// held batch was silently buffered forever -- an effective, permanent frame
+// drop rather than a reorder. The held frame must flush no matter what kind
+// of frame follows it.
+func TestInjectorReorderFlushesHeldFrameBeforeAck(t *testing.T) {
+	in := NewInjector(rand.New(rand.NewSource(4)), Faults{Reorder: true})
+
+	held := false
+	for i := 0; i < 200; i++ {
+		if len(in.Filter("A", "B", eventsFrame())) == 0 {
+			held = true
+			break
+		}
+	}
+	if !held {
+		t.Fatalf("reorder never held a frame in 200 attempts; rng wiring is wrong")
+	}
+	next := in.Filter("A", "B", ackFrame())
+	if len(next) != 2 {
+		t.Fatalf("Filter after Ack following a held Events frame = %d, want 2 (held frame + the Ack) -- held frame was dropped, not reordered", len(next))
 	}
 }
 
@@ -6310,15 +6558,21 @@ func (in *Injector) Filter(from, to clock.NodeID, frame any) []any {
 		in.prior[l] = frame
 	}
 
-	if in.faults.Reorder && isEvents(frame) {
-		// Hold at most one Events frame. The protocol always sends another
-		// frame in the same direction afterwards (a further batch, or the
-		// terminating Ack), so a held frame is always released in the same
-		// turn and no peer can be left parked in Recv.
+	if in.faults.Reorder {
+		// Release any held frame first, regardless of what kind of frame
+		// just arrived. The protocol always sends another frame in the same
+		// direction after an Events batch (a further batch, or -- most
+		// commonly for the *final* batch -- the terminating Ack). An earlier
+		// version of this check only released the held frame when the new
+		// frame was itself an Events frame, so a held frame followed by an
+		// Ack passed the Ack through and left the held Events batch buffered
+		// forever: a silently dropped batch, not a reorder. Checking
+		// unconditionally here is what makes the held frame release in the
+		// same turn regardless of which frame follows it.
 		if h, ok := in.held[l]; ok {
 			delete(in.held, l)
 			out = append(out, h)
-		} else if in.rng.Intn(3) == 0 {
+		} else if isEvents(frame) && in.rng.Intn(3) == 0 {
 			in.held[l] = frame
 			in.stats.Reordered++
 			return nil
@@ -7253,9 +7507,14 @@ func TestApplyOpRejectsAnUnknownNode(t *testing.T) {
 	}
 }
 
-func TestConvergenceSurvivesAggressiveCompactionAgainstAStalePeer(t *testing.T) {
-	// The spec's compaction property: compact aggressively on one node, then
-	// let a peer that has seen nothing sync, and require convergence.
+// TestCompactionSkipsEventsAStalePeerHasNotAcked asserts what AckedFloor
+// actually guarantees when a peer is stale: the floor is empty (N2 has acked
+// nothing), so Compact must delete NOTHING. Earlier versions of this test
+// only asserted convergence after N2 later synced, which passes trivially
+// whether or not Compact deleted anything -- it never proved deletion safety.
+// TestCompactionDeletesEventsOnceAllPeersHaveAcked below is the counterpart
+// that actually exercises deletion.
+func TestCompactionSkipsEventsAStalePeerHasNotAcked(t *testing.T) {
 	ctx := context.Background()
 	sch := GenSchedule(77, 3, 0, Faults{})
 	c, err := NewCluster(t.TempDir(), sch, Faults{})
@@ -7277,9 +7536,14 @@ func TestConvergenceSurvivesAggressiveCompactionAgainstAStalePeer(t *testing.T) 
 		t.Fatalf("SyncPair(N0,N1) error = %v", err)
 	}
 
+	before, err := c.Logs["N0"].CountForSKU(ctx, "SKU-0")
+	if err != nil {
+		t.Fatalf("CountForSKU() before error = %v", err)
+	}
+
 	// Force a snapshot on N0 covering everything it holds, then compact using
-	// only what N1 has acked -- N2 has acked nothing, so nothing N2 lacks may
-	// be deleted.
+	// the acked floor across ALL of N0's peers -- N2 has acked nothing, so
+	// the floor is empty and Compact must delete nothing N2 might still lack.
 	if err := c.Snapshot(ctx, "N0", "SKU-0"); err != nil {
 		t.Fatalf("Snapshot() error = %v", err)
 	}
@@ -7287,11 +7551,23 @@ func TestConvergenceSurvivesAggressiveCompactionAgainstAStalePeer(t *testing.T) 
 	if err != nil {
 		t.Fatalf("AckedFloor() error = %v", err)
 	}
+	if len(acked) != 0 {
+		t.Fatalf("AckedFloor() = %v, want empty -- N2 has acked nothing", acked)
+	}
 	if err := c.Logs["N0"].Compact(ctx, acked); err != nil {
 		t.Fatalf("Compact() error = %v", err)
 	}
 
-	// Now the stale peer syncs and everyone must still converge.
+	after, err := c.Logs["N0"].CountForSKU(ctx, "SKU-0")
+	if err != nil {
+		t.Fatalf("CountForSKU() after error = %v", err)
+	}
+	if after != before {
+		t.Fatalf("Compact() against an empty floor deleted events: before %d, after %d, want unchanged", before, after)
+	}
+
+	// Now the stale peer syncs and everyone must still converge, from the
+	// raw (undeleted) events -- this test never exercised deletion safety.
 	if err := c.Quiesce(ctx, 16); err != nil {
 		t.Fatalf("Quiesce() error = %v", err)
 	}
@@ -7304,6 +7580,73 @@ func TestConvergenceSurvivesAggressiveCompactionAgainstAStalePeer(t *testing.T) 
 	}
 	if got := st.Quantity(); got != 12 {
 		t.Errorf("stale peer quantity = %d, want 12 (12*+2 and 12*-1)", got)
+	}
+}
+
+// TestCompactionDeletesEventsOnceAllPeersHaveAcked is the deletion-safety
+// counterpart: once every peer (including N2) has synced and acked, the
+// floor is no longer empty, Compact must actually delete the covered events,
+// and the stale-snapshot-plus-remainder read path must still converge with
+// every other replica even though the raw event rows are gone on N0.
+func TestCompactionDeletesEventsOnceAllPeersHaveAcked(t *testing.T) {
+	ctx := context.Background()
+	sch := GenSchedule(78, 3, 0, Faults{})
+	c, err := NewCluster(t.TempDir(), sch, Faults{})
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	for i := 0; i < 12; i++ {
+		if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 2}); err != nil {
+			t.Fatalf("ApplyOp() error = %v", err)
+		}
+		if _, err := c.ApplyOp(ctx, Op{Node: "N1", Kind: OpPick, SKU: "SKU-0", Qty: 1}); err != nil {
+			t.Fatalf("ApplyOp() error = %v", err)
+		}
+	}
+	// Every peer syncs with N0 before compaction, so nobody is stale.
+	if err := c.SyncPair(ctx, "N0", "N1"); err != nil {
+		t.Fatalf("SyncPair(N0,N1) error = %v", err)
+	}
+	if err := c.SyncPair(ctx, "N0", "N2"); err != nil {
+		t.Fatalf("SyncPair(N0,N2) error = %v", err)
+	}
+
+	if err := c.Snapshot(ctx, "N0", "SKU-0"); err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	acked, err := c.AckedFloor(ctx, "N0")
+	if err != nil {
+		t.Fatalf("AckedFloor() error = %v", err)
+	}
+	if len(acked) == 0 {
+		t.Fatalf("AckedFloor() = empty, want non-empty -- every peer has acked")
+	}
+	if err := c.Logs["N0"].Compact(ctx, acked); err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	after, err := c.Logs["N0"].CountForSKU(ctx, "SKU-0")
+	if err != nil {
+		t.Fatalf("CountForSKU() after error = %v", err)
+	}
+	if after != 0 {
+		t.Fatalf("CountForSKU() after Compact = %d, want 0 -- fully-acked, snapshotted events must be deleted", after)
+	}
+
+	if err := c.Quiesce(ctx, 16); err != nil {
+		t.Fatalf("Quiesce() error = %v", err)
+	}
+	if err := c.CheckConvergence(ctx, []string{"SKU-0"}); err != nil {
+		t.Fatalf("CheckConvergence() after full compaction = %v", err)
+	}
+	st, err := c.Project(ctx, "N0", "SKU-0")
+	if err != nil {
+		t.Fatalf("Project(N0) error = %v", err)
+	}
+	if got := st.Quantity(); got != 12 {
+		t.Errorf("N0 quantity after compaction = %d, want 12 -- read path must use the snapshot, since the raw events are gone", got)
 	}
 }
 ```
@@ -7790,7 +8133,7 @@ func (c *Cluster) fire(fe FaultEvent) {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cd eventlog-lab && go test ./internal/jepsenlite/ -v`
-Expected: PASS, including `TestConvergenceSurvivesAggressiveCompactionAgainstAStalePeer` and all ten fault combinations at three seeds each.
+Expected: PASS, including `TestCompactionSkipsEventsAStalePeerHasNotAcked`, `TestCompactionDeletesEventsOnceAllPeersHaveAcked`, and all ten fault combinations at three seeds each.
 
 If a fault combination fails, the message already contains the reproducing
 command. Debug it with `superpowers:systematic-debugging`, not by weakening the
@@ -8017,10 +8360,14 @@ import (
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/eventlog"
 )
 
-// TestFullLogDoubleReplayIsIdempotent folds an entire log into a state, then
-// folds the same log into the same state again, and requires no change. This is
-// what makes re-syncing events a replica already holds free.
-func TestFullLogDoubleReplayIsIdempotent(t *testing.T) {
+// TestFullLogReplayIsDeterministic folds the same log into two independent
+// fresh states and requires identical results. This is the actual idempotence
+// guarantee: re-deriving projected state from the deduplicated log is free and
+// repeatable. It is NOT a claim that Apply itself absorbs a duplicate event —
+// folding the same events into an already-populated state would double-count
+// (see TestDuplicateThroughLogIsAbsorbedButDirectApplyDoubleCounts below for
+// where the real dedup boundary is).
+func TestFullLogReplayIsDeterministic(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
@@ -8045,22 +8392,19 @@ func TestFullLogDoubleReplayIsIdempotent(t *testing.T) {
 				}
 			}
 
-			s := NewItemState()
-			if err := s.Fold(l.Since(ctx, eventlog.VersionVector{})); err != nil {
-				t.Fatalf("first Fold() error = %v", err)
-			}
 			first := NewItemState()
 			if err := first.Fold(l.Since(ctx, eventlog.VersionVector{})); err != nil {
-				t.Fatalf("reference Fold() error = %v", err)
+				t.Fatalf("first Fold() error = %v", err)
 			}
-
-			// Second replay into the SAME state must not move it.
-			if err := s.Fold(l.Since(ctx, eventlog.VersionVector{})); err != nil {
+			// Second replay into a FRESH state must match exactly — re-deriving
+			// projected state from the log is deterministic and repeatable.
+			second := NewItemState()
+			if err := second.Fold(l.Since(ctx, eventlog.VersionVector{})); err != nil {
 				t.Fatalf("second Fold() error = %v", err)
 			}
-			if !s.Equal(first) {
-				t.Errorf("double replay changed state: quantity %d, want %d",
-					s.Quantity(), first.Quantity())
+			if !second.Equal(first) {
+				t.Errorf("replay diverged: quantity %d, want %d",
+					second.Quantity(), first.Quantity())
 			}
 		})
 	}
@@ -8709,11 +9053,21 @@ func runNode(args []string, stdout, stderr io.Writer) error {
 	listen := fs.String("listen", "", "address to serve replication on")
 	every := fs.Duration("every", 5*time.Second, "sync interval")
 	once := fs.Bool("once", false, "sync once and exit")
+	timeout := fs.Duration("timeout", 30*time.Second, "bound on a single dial+sync (--once only)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("%w\n%s", err, usage)
 	}
 	if *central == "" {
 		return errors.New("--central is required")
+	}
+	// time.NewTicker panics on a non-positive duration; a malformed --every
+	// must be a clean argument error, not a crash discovered only once the
+	// ticker is reached.
+	if *every <= 0 {
+		return fmt.Errorf("--every must be positive, got %s", *every)
+	}
+	if *timeout <= 0 {
+		return fmt.Errorf("--timeout must be positive, got %s", *timeout)
 	}
 	n, l, err := openNode(*id, *db)
 	if err != nil {
@@ -8725,7 +9079,13 @@ func runNode(args []string, stdout, stderr io.Writer) error {
 		grpc.WithTransportCredentials(insecure.NewCredentials())), 64)
 
 	if *once {
-		rep, err := client.SyncOnce(context.Background(), *central)
+		// context.Background() here would let a dead central hang this
+		// process forever: the gRPC client waits for connectivity and
+		// streams on whatever context dialing is given. --timeout bounds
+		// both the dial and the sync.
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+		defer cancel()
+		rep, err := client.SyncOnce(ctx, *central)
 		if err != nil {
 			return err
 		}
