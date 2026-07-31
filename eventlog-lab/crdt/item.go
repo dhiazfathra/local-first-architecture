@@ -110,16 +110,13 @@ func (s *ItemState) Equal(other *ItemState) bool {
 
 // Marshal serialises s for a snapshot row, per-node counters included.
 //
-// The error return can never actually trigger for an *ItemState: every field
-// is a plain string/int64/bool map or LWW register over those types, none of
-// which json.Marshal can fail on (no channels, funcs, NaN/Inf floats, or
-// cycles). It is kept, rather than ignored, because it is part of the
-// exported contract and a future field addition could change that.
+// The error return is kept for API stability (callers already expect
+// ([]byte, error)), but it can never actually trigger for an *ItemState:
+// every field is a plain string/int64/bool map or LWW register over those
+// types, none of which json.Marshal can fail on (no channels, funcs,
+// NaN/Inf floats, or cycles).
 func Marshal(s *ItemState) ([]byte, error) {
-	b, err := json.Marshal(s)
-	if err != nil {
-		return nil, fmt.Errorf("marshal item state: %w", err)
-	}
+	b, _ := json.Marshal(s) // unreachable: ItemState has no funcs/chans/NaN/cycles
 	return b, nil
 }
 
