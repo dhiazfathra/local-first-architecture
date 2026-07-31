@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package eventloglab.sync.v1;
+
+option go_package = "github.com/dhiazfathra/local-first-architecture/eventlog-lab/sync/syncpb";
+
+service Sync {
+  rpc Replicate(stream ClientFrame) returns (stream ServerFrame);
+}
+
+message ClientFrame {
+  oneof body {
+    Hello  hello  = 1; // my node id + my version vector
+    Events events = 2; // batch of my events the peer lacks
+    Ack    ack    = 3; // version vector after applying peer's batch
+  }
+}
+
+message ServerFrame {
+  oneof body {
+    Welcome welcome = 1; // central's version vector
+    Events  events  = 2;
+    Ack     ack     = 3;
+  }
+}
+
+message Hello {
+  string node_id = 1;
+  map<string, uint64> version_vector = 2;
+}
+
+message Welcome {
+  string node_id = 1;
+  map<string, uint64> version_vector = 2;
+}
+
+message Events {
+  repeated Event events = 1;
+}
+
+message Ack {
+  map<string, uint64> version_vector = 1;
+}
+
+message Event {
+  string node_id     = 1;
+  uint64 seq         = 2;
+  int64  hlc_wall    = 3;
+  uint32 hlc_logical = 4;
+  string sku         = 5;
+  int32  kind        = 6;
+  int64  delta       = 7;  // kind == 1 only
+  optional string name          = 8;  // kind == 2 only
+  optional int64  reorder_point = 9;  // kind == 2 only
+  optional bool   deleted_to    = 10; // kind == 3 only
+}

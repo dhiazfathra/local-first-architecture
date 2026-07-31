@@ -11,6 +11,10 @@ linters:
     - bodyclose
     - sqlclosecheck
     - rowserrcheck
+issues:
+  exclude-rules:
+    - path: sync/syncpb/
+      linters: [revive, staticcheck]
 formatters:
   enable:
     - gofmt
