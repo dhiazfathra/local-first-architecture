@@ -226,3 +226,61 @@ func TestPostgresAppendLocalSerializesConcurrentSeqAllocation(t *testing.T) {
 		t.Fatalf("stored %d events, want %d -- a concurrent append was silently dropped", count, n)
 	}
 }
+
+// TestPostgresCompactDoesNotStrandLaterEventsAcrossSKUs reproduces the
+// stranding bug fixed in Task 10 follow-up: seq is a per-node counter shared
+// across SKUs, so compacting the covered prefix of one SKU while a later,
+// uncovered event from the same node lives under a *different* SKU would
+// strand that later event -- versionVectorQuery's gap-free-prefix computation
+// partitions by node_id across the whole events table, not per-sku, so the
+// gap left behind makes the node's frontier disappear entirely.
+func TestPostgresCompactDoesNotStrandLaterEventsAcrossSKUs(t *testing.T) {
+	ctx := context.Background()
+	l := newPGLog(t)
+
+	// Node A writes seq 1 under SKU-1, then seq 2 under SKU-2.
+	if err := l.Append(ctx, qty("A", 1, 100, "SKU-1", 5)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if err := l.Append(ctx, qty("A", 2, 200, "SKU-2", 3)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	// Only SKU-1 is snapshotted and it only covers seq 1 -- SKU-2's later
+	// event is not covered by any snapshot.
+	if err := l.SaveSnapshot(ctx, "SKU-1", []byte(`{}`), VersionVector{"A": 1}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+
+	// The peer has acked everything, so the naive (unguarded) compact would
+	// delete SKU-1's seq-1 event, leaving only SKU-2's seq-2 event behind --
+	// a gap at seq 1 that makes node A vanish from the version vector.
+	if err := l.Compact(ctx, VersionVector{"A": 2}); err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	got, err := l.VersionVector(ctx)
+	if err != nil {
+		t.Fatalf("VersionVector() error = %v", err)
+	}
+	if got["A"] != 2 {
+		t.Fatalf("VersionVector()[A] = %d, want 2 -- SKU-1's seq-1 event was stranded, corrupting sync", got["A"])
+	}
+
+	// Both events must still be physically present: the guard should have
+	// skipped the delete entirely rather than stranding SKU-2's event.
+	n1, err := l.CountForSKU(ctx, "SKU-1")
+	if err != nil {
+		t.Fatalf("CountForSKU(SKU-1) error = %v", err)
+	}
+	if n1 != 1 {
+		t.Fatalf("SKU-1 events after compaction = %d, want 1 -- stranding guard did not fire", n1)
+	}
+	n2, err := l.CountForSKU(ctx, "SKU-2")
+	if err != nil {
+		t.Fatalf("CountForSKU(SKU-2) error = %v", err)
+	}
+	if n2 != 1 {
+		t.Fatalf("SKU-2 events after compaction = %d, want 1", n2)
+	}
+}

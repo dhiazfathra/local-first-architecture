@@ -318,9 +318,29 @@ func (l *PostgresLog) Compact(ctx context.Context, upTo VersionVector) error {
 			if !ok {
 				continue
 			}
+			safeSeq := min(seq, peerSeq)
+			// VersionVector reports each node's highest gap-free seq starting
+			// at 1. Deleting this node's covered prefix while a later,
+			// uncovered event from the same node survives (in any SKU -- seq
+			// is a per-node counter shared across SKUs) would strand that
+			// event: it would still be held, but the gap left behind makes
+			// VersionVector stop reporting the node at all, which would make
+			// us re-request data we already have, or make a peer believe we
+			// lack data we hold. So skip this node's deletion entirely rather
+			// than risk that; it will compact cleanly once nothing of its
+			// remains beyond the safe point.
+			var stranded bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS(SELECT 1 FROM events WHERE node_id = $1 AND seq > $2)`,
+				string(node), int64(safeSeq)).Scan(&stranded); err != nil {
+				return fmt.Errorf("check stranding for %q/%q: %w", sku, node, err)
+			}
+			if stranded {
+				continue
+			}
 			if _, err := tx.Exec(ctx,
 				`DELETE FROM events WHERE sku = $1 AND node_id = $2 AND seq <= $3`,
-				sku, string(node), int64(min(seq, peerSeq))); err != nil {
+				sku, string(node), int64(safeSeq)); err != nil {
 				return fmt.Errorf("compact %q/%q: %w", sku, node, err)
 			}
 		}
