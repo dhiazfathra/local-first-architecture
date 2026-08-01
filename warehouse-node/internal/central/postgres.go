@@ -163,16 +163,34 @@ func scanEnvelopes(rows pgx.Rows) ([]domain.Envelope, error) {
 	return out, nil
 }
 
-// EmitCentral seals and appends central's own events.
+// EmitCentral seals and appends central's own events. When the emission is
+// compensating a specific event (causation set), the HLC is merged with that
+// event's own HLC so the compensation is guaranteed to sort after its cause in
+// every replay, not just in the order it happened to be applied live.
 func (p *Postgres) EmitCentral(ctx context.Context, events []domain.Event, causation *domain.EventID,
 	now time.Time) ([]domain.Envelope, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	var causing domain.HLC
+	if causation != nil {
+		var ok bool
+		var err error
+		if causing, ok, err = p.hlcOf(ctx, *causation); err != nil {
+			return nil, err
+		} else if !ok {
+			causing = domain.HLC{}
+		}
+	}
+
 	out := make([]domain.Envelope, 0, len(events))
 	for _, e := range events {
 		p.centralN++
-		p.centralHL = domain.Tick(p.centralHL, now.UnixMilli(), CentralNode)
+		if causation != nil {
+			p.centralHL = domain.Merge(p.centralHL, causing, now.UnixMilli(), CentralNode)
+		} else {
+			p.centralHL = domain.Tick(p.centralHL, now.UnixMilli(), CentralNode)
+		}
 		env, err := domain.NewEnvelope(
 			domain.EventID{NodeID: CentralNode, Seq: p.centralN}, p.centralHL, now, causation, e)
 		if err != nil {
@@ -184,6 +202,23 @@ func (p *Postgres) EmitCentral(ctx context.Context, events []domain.Event, causa
 		out = append(out, env)
 	}
 	return out, nil
+}
+
+// hlcOf reads back the HLC reading stored against one event, for merging a
+// compensating event's clock with the event it answers.
+func (p *Postgres) hlcOf(ctx context.Context, id domain.EventID) (domain.HLC, bool, error) {
+	var wall int64
+	var counter int64
+	var node string
+	err := p.pool.QueryRow(ctx, `SELECT hlc_wall, hlc_counter, hlc_node FROM events
+		WHERE node_id = $1 AND seq = $2`, string(id.NodeID), id.Seq).Scan(&wall, &counter, &node)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return domain.HLC{}, false, nil
+	case err != nil:
+		return domain.HLC{}, false, fmt.Errorf("read hlc of %s: %w", id, err)
+	}
+	return domain.HLC{Wall: wall, Counter: uint32(counter), Node: domain.NodeID(node)}, true, nil
 }
 
 // PushedSeq is the highest sequence of a node's own events central has stored.

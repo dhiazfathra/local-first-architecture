@@ -96,16 +96,30 @@ func (m *Memory) sortedEvents() []domain.Envelope {
 }
 
 // EmitCentral seals central's own events, assigning central's sequence numbers
-// and HLC readings, and appends them.
+// and HLC readings, and appends them. When the emission is compensating a
+// specific event (causation set), the HLC is merged with that event's own HLC
+// so the compensation is guaranteed to sort after its cause in every replay,
+// not just in the order it happened to be applied live.
 func (m *Memory) EmitCentral(_ context.Context, events []domain.Event, causation *domain.EventID,
 	now time.Time) ([]domain.Envelope, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	var causing domain.HLC
+	if causation != nil {
+		if env, ok := m.events[*causation]; ok {
+			causing = env.HLC
+		}
+	}
+
 	out := make([]domain.Envelope, 0, len(events))
 	for _, e := range events {
 		m.centralN++
-		m.centralHL = domain.Tick(m.centralHL, now.UnixMilli(), CentralNode)
+		if causation != nil {
+			m.centralHL = domain.Merge(m.centralHL, causing, now.UnixMilli(), CentralNode)
+		} else {
+			m.centralHL = domain.Tick(m.centralHL, now.UnixMilli(), CentralNode)
+		}
 		env, err := domain.NewEnvelope(
 			domain.EventID{NodeID: CentralNode, Seq: m.centralN}, m.centralHL, now, causation, e)
 		if err != nil {
