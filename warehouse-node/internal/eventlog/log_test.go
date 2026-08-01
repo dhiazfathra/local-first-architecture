@@ -498,6 +498,37 @@ func TestIngestOwnEventsAdvancesLocalSequence(t *testing.T) {
 	}
 }
 
+func TestRecoverFailsOnCorruptClockColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.db")
+	clockFn := fixedClock(time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC))
+	l, err := Open(path, "wh-a", clockFn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := l.Emit([]domain.Event{putAway(1)}, nil); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if _, err := l.DB().Exec(`UPDATE events SET hlc_wall = 'not-a-number'`); err != nil {
+		t.Fatalf("corrupt row: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := Open(path, "wh-a", clockFn); err == nil {
+		t.Fatal("expected recover to fail scanning a corrupt hlc_wall on reopen")
+	}
+}
+
+func TestInsertFailsWhenPrepareFailsIndependentlyOfBegin(t *testing.T) {
+	l := openLog(t, "wh-a")
+	if _, err := l.DB().Exec(`DROP TABLE events`); err != nil {
+		t.Fatalf("drop table: %v", err)
+	}
+	if _, err := l.Emit([]domain.Event{putAway(1)}, nil); err == nil {
+		t.Fatal("expected Emit to fail preparing insert against a dropped table")
+	}
+}
+
 func TestOpenFailsOnACorruptDatabaseFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "node.db")
 	if err := os.WriteFile(path, []byte("not a sqlite database"), 0o600); err != nil {
