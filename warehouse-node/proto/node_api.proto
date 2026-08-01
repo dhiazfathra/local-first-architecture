@@ -1,0 +1,151 @@
+syntax = "proto3";
+
+package warehouse.node.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/dhiazfathra/local-first-architecture/warehouse-node/proto/nodeapi;nodeapi";
+
+// Line is an operator-entered quantity before unit conversion: the uom may be the
+// item's base unit or any of its declared alternates.
+message Line {
+  string sku = 1;
+  string lot_id = 2;
+  double qty = 3;
+  string uom = 4;
+}
+
+// CommandResponse returns the identities of the events the command appended, in
+// order. An empty list is impossible: a command either appends or fails.
+message CommandResponse {
+  repeated string event_ids = 1;
+}
+
+message ReceiveRequest {
+  string receipt_id = 1;
+  string delivery_note = 2;
+  string po_ref = 3;
+  Line line = 4;
+  string to = 5;
+}
+
+message PutAwayRequest {
+  Line line = 1;
+  string from = 2;
+  string to = 3;
+}
+
+message PickRequest {
+  Line line = 1;
+  string from = 2;
+  string order_ref = 3;
+}
+
+message ReserveRequest {
+  string reservation_id = 1;
+  Line line = 2;
+  string location = 3;
+}
+
+message ReleaseReservationRequest {
+  string reservation_id = 1;
+}
+
+message StartCountRequest {
+  string count_id = 1;
+  string location = 2;
+}
+
+message CountLineRequest {
+  string count_id = 1;
+  Line line = 2;
+}
+
+message CloseCountRequest {
+  string count_id = 1;
+}
+
+message DispatchTransferRequest {
+  string transfer_id = 1;
+  string to_node = 2;
+  string from = 3;
+  repeated Line lines = 4;
+}
+
+message ReceiveTransferRequest {
+  string transfer_id = 1;
+  string to = 2;
+  repeated Line lines = 3;
+}
+
+message StockOnHandRequest {
+  string sku = 1;
+  string location = 2;
+}
+
+message StockRow {
+  string sku = 1;
+  string location = 2;
+  string lot_id = 3;
+  double qty = 4;
+  double available = 5;
+}
+
+message StockOnHandResponse {
+  repeated StockRow rows = 1;
+}
+
+message ExceptionsRequest {}
+
+// ExceptionRow is one thing central reversed, or one balance a compensation drove
+// negative. resolved is false while it still needs a human.
+message ExceptionRow {
+  string id = 1;
+  string kind = 2;
+  string reason = 3;
+  string caused_by = 4;
+  string sku = 5;
+  string location = 6;
+  string lot_id = 7;
+  double qty = 8;
+  google.protobuf.Timestamp recorded_at = 9;
+  bool resolved = 10;
+}
+
+message ExceptionsResponse {
+  repeated ExceptionRow rows = 1;
+}
+
+message TransfersRequest {}
+
+message TransferRow {
+  string id = 1;
+  string from_node = 2;
+  string to_node = 3;
+  double dispatched = 4;
+  double received = 5;
+  string status = 6;
+  google.protobuf.Timestamp dispatched_at = 7;
+}
+
+message TransfersResponse {
+  repeated TransferRow rows = 1;
+}
+
+// NodeAPI is the operator-facing service. Every command is answered from local
+// state; none of them waits on central.
+service NodeAPI {
+  rpc Receive(ReceiveRequest) returns (CommandResponse);
+  rpc PutAway(PutAwayRequest) returns (CommandResponse);
+  rpc Pick(PickRequest) returns (CommandResponse);
+  rpc Reserve(ReserveRequest) returns (CommandResponse);
+  rpc ReleaseReservation(ReleaseReservationRequest) returns (CommandResponse);
+  rpc StartCount(StartCountRequest) returns (CommandResponse);
+  rpc CountLine(CountLineRequest) returns (CommandResponse);
+  rpc CloseCount(CloseCountRequest) returns (CommandResponse);
+  rpc DispatchTransfer(DispatchTransferRequest) returns (CommandResponse);
+  rpc ReceiveTransfer(ReceiveTransferRequest) returns (CommandResponse);
+  rpc StockOnHand(StockOnHandRequest) returns (StockOnHandResponse);
+  rpc Exceptions(ExceptionsRequest) returns (ExceptionsResponse);
+  rpc Transfers(TransfersRequest) returns (TransfersResponse);
+}
