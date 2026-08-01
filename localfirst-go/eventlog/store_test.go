@@ -419,7 +419,7 @@ func TestAppendSurfacesCommitError(t *testing.T) {
 	if _, err := s.Append(ctx, "T", nil, clock.HLC{Wall: 1, NodeID: "n1"}, nil, cancelProjector{cancel}); err == nil {
 		t.Fatal("Append must fail when Commit is interrupted")
 	}
-	if recs, _ := s.Since(ctx, nil); len(recs) != 0 {
+	if recs, _ := s.Since(context.Background(), nil); len(recs) != 0 {
 		t.Fatalf("interrupted commit left %d records", len(recs))
 	}
 }
@@ -432,7 +432,7 @@ func TestMergeSurfacesCommitError(t *testing.T) {
 	}, cancelProjector{cancel}); err == nil {
 		t.Fatal("Merge must fail when Commit is interrupted")
 	}
-	if recs, _ := s.Since(ctx, nil); len(recs) != 0 {
+	if recs, _ := s.Since(context.Background(), nil); len(recs) != 0 {
 		t.Fatalf("interrupted commit left %d records", len(recs))
 	}
 }
@@ -506,11 +506,12 @@ func cancelMidIteration(delay time.Duration) (context.Context, context.CancelFun
 // cancelled iteration surfaces via rows.Err rather than rows.Scan. Go's
 // database/sql races the two: a mid-iteration cancel sets contextDone, and
 // either the next Next() reports it (rows.Err) or close() lands in the gap
-// before Scan (scan error). Probes measured rows.Err at ~30% per attempt, so
-// a bounded retry hits it within a few tries.
+// before Scan (scan error). Probes measured rows.Err at ~30% per attempt; the
+// cap of 50 puts P(never fired) below ~1.8e-8 per test.
 func requireRowsErr(t *testing.T, what string, fn func(context.Context) error) {
 	t.Helper()
-	for attempt := 0; attempt < 20; attempt++ {
+	const attempts = 50
+	for attempt := 0; attempt < attempts; attempt++ {
 		ctx, cancel := cancelMidIteration(10 * time.Millisecond)
 		err := fn(ctx)
 		cancel()
@@ -518,7 +519,7 @@ func requireRowsErr(t *testing.T, what string, fn func(context.Context) error) {
 			return
 		}
 	}
-	t.Fatalf("%s: rows.Err() branch never fired in 20 attempts", what)
+	t.Fatalf("%s: rows.Err() branch never fired in %d attempts", what, attempts)
 }
 
 func TestSinceSurfacesRowsErr(t *testing.T) {
