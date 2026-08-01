@@ -277,3 +277,19 @@ func TestStateItem(t *testing.T) {
 		})
 	}
 }
+
+// applyEvents seals command output into envelopes and folds it into s, which is
+// what a real caller does after a command succeeds.
+func applyEvents(t *testing.T, s *State, startSeq uint64, at time.Time, events ...Event) {
+	t.Helper()
+	for i, e := range events {
+		env, err := NewEnvelope(EventID{NodeID: "wh-a", Seq: startSeq + uint64(i)},
+			HLC{Wall: int64(startSeq) + int64(i), Node: "wh-a"}, at, nil, e)
+		if err != nil {
+			t.Fatalf("NewEnvelope: %v", err)
+		}
+		if err := s.Apply(env); err != nil {
+			t.Fatalf("Apply(%s): %v", e.Type, err)
+		}
+	}
+}
