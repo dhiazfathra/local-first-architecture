@@ -101,19 +101,43 @@ type State struct {
 	// event central emitted to undo one of ours. The exceptions projection is
 	// built from these.
 	Compensations []Envelope
+	// PendingReceipts holds TransferReceived lines that arrived before this node
+	// learned the matching TransferDispatched metadata, keyed by TransferID. Sync
+	// delivery across different aggregates is not guaranteed to preserve the
+	// causal dispatch-before-receipt order, and a receipt arriving first must not
+	// be silently discarded — the corresponding TransferDispatched folds any
+	// pending lines in once it arrives.
+	PendingReceipts map[string][]Movement
+	// Home is this node's own identity. It is empty by default (used by pure
+	// domain tests that only ever apply a single node's own events, where every
+	// TransferDispatched/TransferReceived folded in is unconditionally this
+	// node's own movement). A node.Service sets it via SetHome so that a
+	// TransferDispatched or TransferReceived forwarded by central purely for
+	// metadata — because it did not originate here and was not addressed here —
+	// updates transfer bookkeeping only and never moves stock. Without this gate,
+	// the destination of a transfer folds the source's own From/To locations into
+	// its own Stock map the moment central relays the dispatch for visibility,
+	// corrupting the destination's projection with balances at locations it does
+	// not own.
+	Home NodeID
 }
+
+// SetHome fixes this state's own node identity after construction. Call it once,
+// before applying any events, on any State backing a running node.Service.
+func (s *State) SetHome(id NodeID) { s.Home = id }
 
 // NewState returns an empty state with every map ready to use.
 func NewState() *State {
 	return &State{
-		Items:        map[string]Item{},
-		Locations:    map[LocationCode]LocationType{},
-		Lots:         map[string]Lot{},
-		Stock:        map[StockKey]float64{},
-		Reservations: map[string]Reservation{},
-		Receipts:     map[string]*ReceiptState{},
-		Transfers:    map[string]*TransferState{},
-		Counts:       map[string]*CountState{},
+		Items:           map[string]Item{},
+		Locations:       map[LocationCode]LocationType{},
+		Lots:            map[string]Lot{},
+		Stock:           map[StockKey]float64{},
+		Reservations:    map[string]Reservation{},
+		Receipts:        map[string]*ReceiptState{},
+		Transfers:       map[string]*TransferState{},
+		Counts:          map[string]*CountState{},
+		PendingReceipts: map[string][]Movement{},
 	}
 }
 
@@ -194,24 +218,69 @@ func (s *State) Apply(envelope Envelope) error {
 			r.Status = ReceiptClosedStatus
 		}
 	case TransferDispatched:
-		t := &TransferState{
-			ID: p.TransferID, FromNode: p.FromNode, ToNode: p.ToNode,
-			Dispatched: map[StockKey]float64{}, Received: map[StockKey]float64{},
-			Status: TransferInFlight,
+		t, existing := s.Transfers[p.TransferID]
+		if !existing {
+			t = &TransferState{
+				ID: p.TransferID, FromNode: p.FromNode, ToNode: p.ToNode,
+				Dispatched: map[StockKey]float64{}, Received: map[StockKey]float64{},
+				Status: TransferInFlight,
+			}
 		}
+		// Only the originating node's own stock actually left a shelf. Central
+		// also relays this same event to the destination purely so it can learn
+		// transfer metadata ahead of the truck; folding it into the destination's
+		// own Stock map there would apply the source's From/To locations against
+		// the destination's projection, corrupting it with balances at locations
+		// the destination does not own. Home == "" (a pure domain test applying
+		// only its own node's events) always applies the move, matching prior
+		// behavior.
+		mine := s.Home == "" || s.Home == p.FromNode
 		for _, line := range p.Lines {
 			t.Dispatched[StockKey{SKU: line.SKU, LotID: line.LotID}] += line.Qty
-			s.move(line)
+			if mine {
+				s.move(line)
+			}
+		}
+		// A TransferReceived for this transfer may have arrived first — sync
+		// delivery does not guarantee dispatch-before-receipt across aggregates —
+		// and been buffered in PendingReceipts instead of discarded. Fold it in now
+		// that the dispatch has finally arrived.
+		if pending, buffered := s.PendingReceipts[p.TransferID]; buffered {
+			mineRecv := s.Home == "" || s.Home == p.ToNode
+			for _, line := range pending {
+				t.Received[StockKey{SKU: line.SKU, LotID: line.LotID}] += line.Qty
+				if mineRecv {
+					s.move(line)
+				}
+			}
+			if t.Status == TransferInFlight {
+				t.Status = TransferComplete
+			}
+			delete(s.PendingReceipts, p.TransferID)
 		}
 		s.Transfers[p.TransferID] = t
 	case TransferReceived:
 		t, ok := s.Transfers[p.TransferID]
 		if !ok {
+			// This node has not learned the matching TransferDispatched metadata
+			// yet. The receipt is not discarded: it is buffered so the dispatch,
+			// whenever it arrives, can fold it in and the transfer never gets
+			// stuck showing zero received despite the receipt already being in
+			// the log.
+			s.PendingReceipts[p.TransferID] = append(s.PendingReceipts[p.TransferID], p.Lines...)
 			return nil
 		}
+		// Symmetric with the dispatch case above: this event moved stock only at
+		// the destination that actually received it. Central also relays it back
+		// to the source purely for transfer-projection visibility (so the
+		// source's view of the transfer does not stay stuck in-flight forever),
+		// and that relay must not move stock at the source.
+		mine := s.Home == "" || s.Home == t.ToNode
 		for _, line := range p.Lines {
 			t.Received[StockKey{SKU: line.SKU, LotID: line.LotID}] += line.Qty
-			s.move(line)
+			if mine {
+				s.move(line)
+			}
 		}
 		if t.Status == TransferInFlight {
 			t.Status = TransferComplete

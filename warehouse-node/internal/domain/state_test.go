@@ -178,6 +178,45 @@ func TestTransferStaysInFlightUntilReceived(t *testing.T) {
 	}
 }
 
+func TestSetHomeGatesTransferStockMovement(t *testing.T) {
+	// wh-b is the destination. Central relays the dispatch to wh-b purely for
+	// metadata; wh-b must not move stock at wh-a's PICK-01, since it does not
+	// own that location. It also buffers a TransferReceived that arrives before
+	// the dispatch, and must move stock for that receipt since wh-b is the
+	// receiving node.
+	s := NewState()
+	s.SetHome("wh-b")
+
+	if err := s.Apply(env(t, 1, TypeTransferReceived, "T1", TransferReceived{
+		TransferID: "T1", Lines: []Movement{{SKU: "WIDGET", From: External, To: "RECV-01", Qty: 3}},
+	})); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(s.PendingReceipts["T1"]) != 1 {
+		t.Fatalf("PendingReceipts[T1] = %+v, want 1 buffered line", s.PendingReceipts["T1"])
+	}
+
+	if err := s.Apply(env(t, 2, TypeTransferDispatched, "T1", TransferDispatched{
+		TransferID: "T1", FromNode: "wh-a", ToNode: "wh-b",
+		Lines: []Movement{{SKU: "WIDGET", From: "PICK-01", To: External, Qty: 3}},
+	})); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if got := s.OnHand(StockKey{SKU: "WIDGET", Location: "PICK-01"}); got != 0 {
+		t.Fatalf("OnHand(PICK-01) = %v, want 0 (not this node's stock)", got)
+	}
+	if got := s.OnHand(StockKey{SKU: "WIDGET", Location: "RECV-01"}); got != 3 {
+		t.Fatalf("OnHand(RECV-01) = %v, want 3 (this node received it)", got)
+	}
+	if _, buffered := s.PendingReceipts["T1"]; buffered {
+		t.Fatalf("PendingReceipts[T1] still buffered after dispatch arrived")
+	}
+	if s.Transfers["T1"].Status != TransferComplete {
+		t.Fatalf("status = %q, want %q", s.Transfers["T1"].Status, TransferComplete)
+	}
+}
+
 func TestApplyIgnoresEventsForUnknownAggregates(t *testing.T) {
 	// Events can arrive out of order across a sync boundary; Apply must not panic
 	// or error on a line for a receipt/count/transfer it has never seen. Later
