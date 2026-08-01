@@ -245,6 +245,12 @@ Two consequences worth stating plainly:
 - **Sync needs no changes at all.** `sync.Exchange` moves `eventlog.Record`s. A
   task list replicates and converges under exactly the same protocol as
   inventory, with the same idempotent append and the same resumption behaviour.
+  That convergence claim assumes one completion per task: `Reducer.Apply`
+  rejects a second `Completed` with `ErrAlreadyDone`, and this worked example
+  does not add task ownership, so two nodes completing the same task offline
+  is not conflict-safe here — the second event fails on replay instead of
+  converging. A real task-list domain would need ownership or idempotent
+  completion to close that gap.
 - **`central.PGStore.GlobalSum` does not carry over**, and that is correct.
   Summing balances is an inventory question. A task list would ask something
   else — "how many tasks are open across all nodes?" — and that query, like the

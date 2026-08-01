@@ -34,6 +34,12 @@ type Inventory struct {
 
 	mu    sync.RWMutex
 	state State
+
+	// appendMu serializes clk.Now() with store.Append so concurrent commands
+	// cannot generate timestamps in one order and receive sequence IDs in
+	// another, which would break the ordering this node's HLC/seq stream
+	// documents.
+	appendMu sync.Mutex
 }
 
 // NewInventory rebuilds balances by replaying the whole log, then serves
@@ -90,6 +96,8 @@ func (i *Inventory) guard(qty int64, location string) error {
 }
 
 func (i *Inventory) append(ctx context.Context, typ string, ev any) error {
+	i.appendMu.Lock()
+	defer i.appendMu.Unlock()
 	// The store calls i.Check then i.Project inside one transaction.
 	_, err := i.store.Append(ctx, typ, encode(ev), i.clk.Now(), i, i)
 	return err
@@ -120,20 +128,21 @@ func (i *Inventory) Check(r eventlog.Record) error {
 	return nil
 }
 
-// touchedKeys returns the balance keys r's Apply call can change. Errors are
-// ignored here because Apply above already decoded r successfully; an
-// unrecognized type would have failed there first.
+// touchedKeys returns the balance keys r's Apply call can decrement. Only
+// decrementing keys need the negative-balance guard: a credit can only move a
+// balance up, so it can reduce an existing negative shadow balance but can
+// never push a non-negative one below zero. Received has no decrementing key,
+// and Moved's destination is a credit, so only Issued.Location and Moved.From
+// are validated. Errors are ignored here because Apply above already decoded r
+// successfully; an unrecognized type would have failed there first.
 func touchedKeys(r eventlog.Record) []Key {
 	switch r.Type {
-	case TypeReceived:
-		ev, _ := decode[Received](r)
-		return []Key{{ev.SKU, ev.Location}}
 	case TypeIssued:
 		ev, _ := decode[Issued](r)
 		return []Key{{ev.SKU, ev.Location}}
 	case TypeMoved:
 		ev, _ := decode[Moved](r)
-		return []Key{{ev.SKU, ev.From}, {ev.SKU, ev.To}}
+		return []Key{{ev.SKU, ev.From}}
 	default:
 		return nil
 	}

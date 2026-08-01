@@ -80,10 +80,15 @@ func TestRelativeLinksResolve(t *testing.T) {
 			// Sibling reference architectures live outside this module and are
 			// not checked out in every environment, so their presence is not
 			// this repo's invariant.
-			if strings.HasPrefix(target, "../../../") {
+			resolved := filepath.Clean(filepath.Join(filepath.Dir(path), target))
+			rel, relErr := filepath.Rel(root, resolved)
+			if relErr != nil {
+				return relErr
+			}
+			if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 				continue
 			}
-			if _, statErr := os.Stat(filepath.Join(filepath.Dir(path), target)); statErr != nil {
+			if _, statErr := os.Stat(resolved); statErr != nil {
 				t.Errorf("%s: broken link %q", path, raw)
 			}
 		}

@@ -53,6 +53,11 @@ Bad, and accepted:
   compensating events.
 - Ownership must be assigned somewhere outside this system, and reassigning a
   location between nodes is not modelled at all.
+- `cmd/node` treats an empty `-locations` list as "own everything" rather than
+  "own nothing", which disables the ownership check entirely. That is a known
+  constraint for single-node and demo/central usage only; a real multi-node
+  deployment must configure at least one owned location per node, or this
+  invariant does not hold.
 - Between the source's decrement and the destination's increment reaching
   central, transferred goods are absent from the global sum. That gap is real
   and documented in [limitations](../limitations.md).

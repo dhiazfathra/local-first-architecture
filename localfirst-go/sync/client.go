@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"google.golang.org/grpc"
@@ -38,11 +39,13 @@ func NewClient(cc grpc.ClientConnInterface, log Log, p eventlog.Projector, peer 
 // status before advancing the cursor, or a failed remote merge would be
 // recorded as a successful sync.
 func (c *Client) SyncOnce(ctx context.Context) (eventlog.VersionVector, error) {
-	stream, err := c.rpc.Replicate(ctx)
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream, err := c.rpc.Replicate(streamCtx)
 	if err != nil {
 		return nil, err
 	}
-	vv, err := Exchange(ctx, c.log, c.proj, stream, true)
+	vv, err := Exchange(streamCtx, c.log, c.proj, stream, true)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +65,12 @@ func (c *Client) SyncOnce(ctx context.Context) (eventlog.VersionVector, error) {
 // with a capped backoff; it never stops the node from accepting local commands,
 // because nothing here is on the command path.
 func (c *Client) Run(ctx context.Context, every time.Duration) {
-	backoff := every
+	const minInterval = 100 * time.Millisecond
 	const maxBackoff = 30 * time.Second
+	if every < minInterval {
+		every = minInterval
+	}
+	backoff := every
 	for {
 		if _, err := c.SyncOnce(ctx); err != nil {
 			slog.WarnContext(ctx, "sync failed, node still operational",
@@ -75,7 +82,16 @@ func (c *Client) Run(ctx context.Context, every time.Duration) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(backoff + jitter(backoff)):
 		}
 	}
+}
+
+// jitter spreads retries so peers that lose the same central at once do not
+// all recover on the same schedule.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(d)/4 + 1))
 }

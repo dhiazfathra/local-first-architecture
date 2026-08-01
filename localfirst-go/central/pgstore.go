@@ -134,11 +134,10 @@ func (s *PGStore) Since(ctx context.Context, vv eventlog.VersionVector) ([]event
 	var out []eventlog.Record
 	for rows.Next() {
 		var r eventlog.Record
-		var logical int64
-		if err := rows.Scan(&r.NodeID, &r.Seq, &r.Clock.Wall, &logical, &r.Type, &r.Payload); err != nil {
+		if err := rows.Scan(&r.NodeID, &r.Seq, &r.Clock.Wall, &r.Clock.Logical, &r.Type, &r.Payload); err != nil {
 			return nil, fmt.Errorf("central: scan: %w", err)
 		}
-		r.Clock.Logical, r.Clock.NodeID = uint32(logical), r.NodeID
+		r.Clock.NodeID = r.NodeID
 		if r.Seq > vv.Get(r.NodeID) {
 			out = append(out, r)
 		}

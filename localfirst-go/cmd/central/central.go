@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -40,7 +41,15 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() { errc <- srv.Serve(lis) }()
 	select {
 	case <-ctx.Done():
-		srv.GracefulStop()
+		// Replicate is a long-lived stream; a peer that never closes it must
+		// not block shutdown forever.
+		stopped := make(chan struct{})
+		go func() { srv.GracefulStop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			srv.Stop()
+		}
 		return nil
 	case err := <-errc:
 		return err

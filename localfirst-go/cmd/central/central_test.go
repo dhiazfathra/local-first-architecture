@@ -32,8 +32,9 @@ func dsn(t *testing.T) string {
 
 func TestRunStartsAndStops(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	cfg := Config{DSN: dsn(t), Listen: freeAddr(t), NodeID: "central"}
 	done := make(chan error, 1)
-	go func() { done <- Run(ctx, Config{DSN: dsn(t), Listen: freeAddr(t), NodeID: "central"}) }()
+	go func() { done <- Run(ctx, cfg) }()
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 	select {

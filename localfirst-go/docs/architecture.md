@@ -143,7 +143,7 @@ again for free.
 
 ## Where your domain plugs in
 
-Two interfaces, and a command encoder:
+Reading, and the two interfaces `Append` calls in the writing seam:
 
 ```go
 // reading
@@ -155,6 +155,10 @@ type Reducer[S any] interface {
 // writing, called inside the append transaction
 type Validator interface {
 	Check(r Record) error
+}
+
+type Projector interface {
+	Project(r Record) (func(), error)
 }
 ```
 

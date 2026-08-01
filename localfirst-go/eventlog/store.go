@@ -207,7 +207,7 @@ func nonNil(b []byte) []byte {
 // Since returns every held record the caller lacks according to vv, in replay
 // order (HLC, then author sequence). A nil vv means "everything".
 //
-// ponytail: scans the log and filters in Go — clear, and correct for a
+// Note: it scans the log and filters in Go — clear, and correct for a
 // reference architecture. Push the filter into SQL per node if logs get big.
 func (s *Store) Since(ctx context.Context, vv VersionVector) ([]Record, error) {
 	rows, err := s.db.QueryContext(ctx,

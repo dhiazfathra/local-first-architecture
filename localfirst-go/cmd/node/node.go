@@ -56,20 +56,36 @@ func Run(ctx context.Context, cfg Config) error {
 	// increment stays invisible until the process restarts and replays the log.
 	syncpb.RegisterSyncServer(srv, lfsync.NewServer(store, inv))
 
+	var syncDone chan struct{}
 	if cfg.CentralAddr != "" {
 		cc, err := grpc.NewClient(cfg.CentralAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("node: dial central: %w", err)
 		}
 		defer func() { _ = cc.Close() }()
-		go lfsync.NewClient(cc, store, inv, "central").Run(ctx, cfg.SyncEvery)
+		syncDone = make(chan struct{})
+		go func() {
+			defer close(syncDone)
+			lfsync.NewClient(cc, store, inv, "central").Run(ctx, cfg.SyncEvery)
+		}()
 	}
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(lis) }()
 	select {
 	case <-ctx.Done():
-		srv.GracefulStop()
+		// Replicate is a long-lived stream; a peer that never closes it must
+		// not block shutdown forever.
+		stopped := make(chan struct{})
+		go func() { srv.GracefulStop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			srv.Stop()
+		}
+		if syncDone != nil {
+			<-syncDone // the sync client still uses store and cc until it exits
+		}
 		return nil
 	case err := <-errc:
 		return err

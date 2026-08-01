@@ -496,7 +496,7 @@ func TestSyncOnceFailsWhenTheCursorWriteFails(t *testing.T) {
 // TestClientRunSyncsOnAScheduleUntilCancelled: Run's success path resets the
 // backoff and keeps looping, and cancelling the context stops it.
 func TestClientRunSyncsOnAScheduleUntilCancelled(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	node, central := store(t, "n1"), store(t, "central")
 	appendN(t, node, 3)
@@ -504,6 +504,15 @@ func TestClientRunSyncsOnAScheduleUntilCancelled(t *testing.T) {
 	cc := serve(t, central, nil)
 	done := make(chan struct{})
 	go func() { lfsync.NewClient(cc, node, nil, "central").Run(ctx, 10*time.Millisecond); close(done) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cur, err := node.Cursor(context.Background(), "central"); err == nil && cur == 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):

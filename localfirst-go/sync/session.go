@@ -78,7 +78,10 @@ func Exchange(
 		}
 		return vv, nil
 	}
-	return log.Version(ctx)
+	// The responder's caller ignores this value (Server.Replicate discards
+	// it), so do not risk failing an already-successful exchange on a query
+	// nobody reads.
+	return nil, nil
 }
 
 func sendHello(ctx context.Context, log Log, s Stream) error {
@@ -112,7 +115,7 @@ func pushAndAck(ctx context.Context, log Log, s Stream, peerVV eventlog.VersionV
 	if err != nil {
 		return nil, err
 	}
-	bounded := make([]eventlog.Record, 0, len(recs))
+	bounded := recs[:0]
 	for _, r := range recs {
 		if r.Seq <= vv.Get(r.NodeID) {
 			bounded = append(bounded, r)
@@ -149,7 +152,11 @@ func drain(ctx context.Context, log Log, p eventlog.Projector, s Stream) error {
 			pbRecs := body.Batch.GetRecords()
 			recs := make([]eventlog.Record, len(pbRecs))
 			for i, pb := range pbRecs {
-				recs[i] = RecordFromPB(pb)
+				r := RecordFromPB(pb)
+				if err := ValidatePeerRecord(r, log.NodeID()); err != nil {
+					return err
+				}
+				recs[i] = r
 			}
 			if _, err := log.Merge(ctx, recs, p); err != nil {
 				return err

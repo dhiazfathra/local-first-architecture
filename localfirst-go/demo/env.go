@@ -148,7 +148,9 @@ func (e *ComposeEnv) WaitReady(ctx context.Context, timeout time.Duration) error
 			continue
 		}
 		for {
-			_, err := gn.client.Balances(ctx, &nodepb.Empty{})
+			attempt, cancel := context.WithDeadline(ctx, deadline)
+			_, err := gn.client.Balances(attempt, &nodepb.Empty{})
+			cancel()
 			if err == nil {
 				break
 			}

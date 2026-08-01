@@ -126,15 +126,18 @@ func TestSyncedMovedEventUpdatesTheDestinationNodesBalances(t *testing.T) {
 	defer cancel()
 
 	addr1, addr2 := freeAddr(t), freeAddr(t)
+	db1 := filepath.Join(t.TempDir(), "n1.db")
+	db2 := filepath.Join(t.TempDir(), "n2.db")
+	runErr := make(chan error, 2)
 	go func() {
-		_ = Run(ctx, Config{
-			NodeID: "n1", DBPath: filepath.Join(t.TempDir(), "n1.db"),
+		runErr <- Run(ctx, Config{
+			NodeID: "n1", DBPath: db1,
 			Listen: addr1, Locations: []string{"A"}, SyncEvery: time.Hour,
 		})
 	}()
 	go func() {
-		_ = Run(ctx, Config{
-			NodeID: "n2", DBPath: filepath.Join(t.TempDir(), "n2.db"),
+		runErr <- Run(ctx, Config{
+			NodeID: "n2", DBPath: db2,
 			Listen: addr2, Locations: []string{"B"},
 			CentralAddr: addr1, SyncEvery: 20 * time.Millisecond,
 		})
@@ -171,6 +174,11 @@ func TestSyncedMovedEventUpdatesTheDestinationNodesBalances(t *testing.T) {
 	deadline = time.Now().Add(5 * time.Second)
 	var got int64
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-runErr:
+			t.Fatalf("Run exited early: %v", err)
+		default:
+		}
 		bal, err := n2.Balance(ctx, &nodepb.BalanceRequest{Sku: "S", Location: "B"})
 		if err == nil {
 			if got = bal.GetQty(); got == 4 {

@@ -24,8 +24,10 @@ func main() {
 	flag.StringVar(&locations, "locations", "", "comma-separated locations this node owns")
 	flag.DurationVar(&cfg.SyncEvery, "sync-every", 2*time.Second, "sync interval")
 	flag.Parse()
-	if locations != "" {
-		cfg.Locations = strings.Split(locations, ",")
+	for _, loc := range strings.Split(locations, ",") {
+		if loc = strings.TrimSpace(loc); loc != "" {
+			cfg.Locations = append(cfg.Locations, loc)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

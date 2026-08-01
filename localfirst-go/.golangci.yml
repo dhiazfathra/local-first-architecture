@@ -8,10 +8,10 @@ linters:
     - unused
     - revive
     - misspell
+  exclusions:
+    rules:
+      - path: syncpb/
+        linters: [revive, staticcheck]
 formatters:
   enable:
     - gofmt
-issues:
-  exclude-rules:
-    - path: syncpb/
-      linters: [revive, staticcheck]

@@ -54,7 +54,7 @@ demo cannot drift from the documentation describing it.
 
 ## Layout
 
-```
+```text
 localfirst-go/
   clock/           hybrid logical clock                  (domain-agnostic)
   eventlog/        append-only SQLite log + seams         (domain-agnostic)

@@ -86,7 +86,7 @@ func Run(ctx context.Context, env Env, out io.Writer) (Result, error) {
 	var res Result
 
 	nodes := env.Nodes()
-	if len(nodes) != 3 {
+	if len(nodes) != 3 || len(Seed) != len(nodes) {
 		return res, fmt.Errorf("%w: got %d", ErrWantThreeNodes, len(nodes))
 	}
 
