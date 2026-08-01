@@ -263,11 +263,14 @@ func (p *Postgres) setCursor(ctx context.Context, node domain.NodeID, column str
 	return nil
 }
 
-// Enqueue adds events to a node's downstream queue.
+// Enqueue adds events to a node's downstream queue. It is idempotent per (target,
+// event): a retried arbitration that already queued an event for this target is a
+// no-op the second time, rather than duplicating the outbound row.
 func (p *Postgres) Enqueue(ctx context.Context, target domain.NodeID, envs []domain.Envelope) error {
 	for _, env := range envs {
 		if _, err := p.pool.Exec(ctx,
-			`INSERT INTO outbound (target_node, node_id, seq) VALUES ($1, $2, $3)`,
+			`INSERT INTO outbound (target_node, node_id, seq) VALUES ($1, $2, $3)
+			ON CONFLICT (target_node, node_id, seq) DO NOTHING`,
 			string(target), string(env.ID.NodeID), env.ID.Seq); err != nil {
 			return fmt.Errorf("enqueue %s for %s: %w", env.ID, target, err)
 		}
@@ -488,9 +491,29 @@ func (p *Postgres) RecordDispatch(ctx context.Context, row InTransitRow) error {
 	return nil
 }
 
-// AddReceived adds to the received quantity of an existing in-transit balance.
-func (p *Postgres) AddReceived(ctx context.Context, transferID string, k domain.StockKey, qty float64) error {
-	tag, err := p.pool.Exec(ctx, `UPDATE in_transit SET received = received + $4
+// AddReceived adds to the received quantity of an existing in-transit balance. It is
+// idempotent per (eventID, SKU, lot): a retried arbitration that already folded this
+// event's line into the balance returns nil without adding qty again. The natural-key
+// insert and the balance update run in one transaction so a rejected update (unknown
+// transfer/line) never leaves a phantom "already applied" marker behind.
+func (p *Postgres) AddReceived(ctx context.Context, eventID domain.EventID, transferID string, k domain.StockKey, qty float64) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin add received to %s: %w", transferID, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	tag, err := tx.Exec(ctx, `INSERT INTO transfer_receipts (event_node, event_seq, sku, lot_id)
+		VALUES ($1,$2,$3,$4) ON CONFLICT (event_node, event_seq, sku, lot_id) DO NOTHING`,
+		string(eventID.NodeID), int64(eventID.Seq), k.SKU, k.LotID)
+	if err != nil {
+		return fmt.Errorf("record transfer receipt for %s: %w", transferID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil // already folded into the balance by an earlier attempt
+	}
+
+	tag, err = tx.Exec(ctx, `UPDATE in_transit SET received = received + $4
 		WHERE transfer_id = $1 AND sku = $2 AND lot_id = $3`, transferID, k.SKU, k.LotID, qty)
 	if err != nil {
 		return fmt.Errorf("add received to %s: %w", transferID, err)
@@ -498,7 +521,7 @@ func (p *Postgres) AddReceived(ctx context.Context, transferID string, k domain.
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("transfer %s has no dispatched line for %s/%s", transferID, k.SKU, k.LotID)
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // InTransit reads one in-transit balance.

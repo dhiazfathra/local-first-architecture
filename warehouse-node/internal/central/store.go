@@ -121,7 +121,9 @@ type Store interface {
 	DeliveryNoteFirstSeen(ctx context.Context, note, sku string) (domain.EventID, bool, error)
 
 	RecordDispatch(ctx context.Context, row InTransitRow) error
-	AddReceived(ctx context.Context, transferID string, k domain.StockKey, qty float64) error
+	// AddReceived is idempotent per (event, SKU, lot): a retried arbitration that
+	// already folded eventID's line into the balance is a no-op the second time.
+	AddReceived(ctx context.Context, eventID domain.EventID, transferID string, k domain.StockKey, qty float64) error
 	InTransit(ctx context.Context, transferID string, k domain.StockKey) (InTransitRow, bool, error)
 	// OpenTransfers returns transfers dispatched before the given instant that are
 	// still carrying stock. They are reported as discrepancies, never

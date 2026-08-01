@@ -207,7 +207,7 @@ func TestPostgresOperationsFailAfterClose(t *testing.T) {
 	if err := store.RecordDispatch(ctx, InTransitRow{TransferID: "T1", Key: domain.StockKey{SKU: "WIDGET"}}); err == nil {
 		t.Error("RecordDispatch after Close: expected an error")
 	}
-	if err := store.AddReceived(ctx, "T1", domain.StockKey{SKU: "WIDGET"}, 1); err == nil {
+	if err := store.AddReceived(ctx, domain.EventID{NodeID: "wh-a", Seq: 1}, "T1", domain.StockKey{SKU: "WIDGET"}, 1); err == nil {
 		t.Error("AddReceived after Close: expected an error")
 	}
 	if _, _, err := store.InTransit(ctx, "T1", domain.StockKey{SKU: "WIDGET"}); err == nil {

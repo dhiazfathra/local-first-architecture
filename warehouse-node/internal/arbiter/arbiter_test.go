@@ -560,6 +560,47 @@ func TestArbitrateRejectsAnUndecodableEvent(t *testing.T) {
 	}
 }
 
+// TestDualViolationYieldsExactlyOneCompensationFromTheFirstValidator proves that an
+// event breaking two rules at once produces exactly one compensation, from whichever
+// validator runs first in New's chain — not one per broken rule. The event here both
+// names a now-deleted (so "unknown") SKU and duplicates an already-seen delivery
+// note/SKU pair; unknownSKU precedes duplicateDeliveryNote in the chain, so that's the
+// one that must fire.
+func TestDualViolationYieldsExactlyOneCompensationFromTheFirstValidator(t *testing.T) {
+	a, store := newArbiter(t)
+	ctx := context.Background()
+	if err := store.UpsertItem(ctx, domain.Item{SKU: "GHOST", Description: "Will be deleted",
+		BaseUoM: "EA", LotTracked: true}); err != nil {
+		t.Fatalf("UpsertItem: %v", err)
+	}
+
+	first := env(t, "wh-a", 1, domain.TypeGoodsReceived, "R1",
+		goodsReceived("R1", "DN-1", "PO-1", "GHOST", "L1", 10, "RECV-01"))
+	if _, _, err := a.Arbitrate(ctx, first); err != nil {
+		t.Fatalf("seed Arbitrate: %v", err)
+	}
+	if err := store.UpsertItem(ctx, domain.Item{SKU: "GHOST", Description: "Will be deleted",
+		BaseUoM: "EA", LotTracked: true, Deleted: true}); err != nil {
+		t.Fatalf("delete GHOST: %v", err)
+	}
+
+	// Same note, same SKU as the seed above, and GHOST is now deleted: this event
+	// both names an unknown SKU and duplicates an already-keyed delivery note.
+	dual := env(t, "wh-b", 1, domain.TypeGoodsReceived, "R2",
+		goodsReceived("R2", "DN-1", "PO-1", "GHOST", "L1", 5, "RECV-09"))
+	decision, comps, err := a.Arbitrate(ctx, dual)
+	if err != nil {
+		t.Fatalf("Arbitrate: %v", err)
+	}
+	if decision.Verdict != central.VerdictRejected || decision.Reason != domain.ReasonUnknownSKU {
+		t.Fatalf("decision = %+v, want rejected with reason %q (unknownSKU runs first)",
+			decision, domain.ReasonUnknownSKU)
+	}
+	if len(comps) != 1 {
+		t.Fatalf("comps = %+v, want exactly one compensation, not one per broken rule", comps)
+	}
+}
+
 func TestValidatorsAreNamedAndOrdered(t *testing.T) {
 	a, _ := newArbiter(t)
 	want := []string{"unknown_sku", "duplicate_delivery_note", "po_over_receipt",

@@ -117,11 +117,11 @@ func (f errFake) RecordDispatch(ctx context.Context, row central.InTransitRow) e
 	return f.Store.RecordDispatch(ctx, row)
 }
 
-func (f errFake) AddReceived(ctx context.Context, transferID string, k domain.StockKey, qty float64) error {
+func (f errFake) AddReceived(ctx context.Context, eventID domain.EventID, transferID string, k domain.StockKey, qty float64) error {
 	if err := f.fail("AddReceived"); err != nil {
 		return err
 	}
-	return f.Store.AddReceived(ctx, transferID, k, qty)
+	return f.Store.AddReceived(ctx, eventID, transferID, k, qty)
 }
 
 func (f errFake) FailTransfer(ctx context.Context, transferID string) error {

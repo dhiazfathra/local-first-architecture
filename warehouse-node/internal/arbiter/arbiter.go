@@ -192,7 +192,7 @@ func (a *Arbiter) record(ctx context.Context, env domain.Envelope, payload any, 
 			if accepted <= 0 {
 				continue
 			}
-			if err := a.store.AddReceived(ctx, p.TransferID, key, accepted); err != nil {
+			if err := a.store.AddReceived(ctx, env.ID, p.TransferID, key, accepted); err != nil {
 				return err
 			}
 		}

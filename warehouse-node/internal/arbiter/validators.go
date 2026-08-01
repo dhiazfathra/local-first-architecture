@@ -80,6 +80,10 @@ func (duplicateDeliveryNote) Validate(ctx context.Context, s central.Store, env 
 		return nil, err
 	}
 	if !found || first == env.ID {
+		// first == env.ID is not dead code: it's what stops a post-crash retry from
+		// rejecting itself. record's RecordReceipt runs before RecordDecision is
+		// persisted, so a retry that re-reaches this validator finds itself as the
+		// note's own first sighting rather than a duplicate.
 		return nil, nil
 	}
 	return &Rejection{

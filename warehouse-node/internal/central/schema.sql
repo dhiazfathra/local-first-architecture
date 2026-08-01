@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS outbound (
 
 CREATE INDEX IF NOT EXISTS outbound_target ON outbound (target_node, ord);
 
+-- Natural key of an outbound entry: enqueuing the same event for the same target
+-- twice (a crash-retry of arbitration) must not duplicate the queue row.
+CREATE UNIQUE INDEX IF NOT EXISTS outbound_natural_key ON outbound (target_node, node_id, seq);
+
 CREATE TABLE IF NOT EXISTS items (
     sku             TEXT PRIMARY KEY,
     description     TEXT    NOT NULL,
@@ -94,6 +98,17 @@ CREATE TABLE IF NOT EXISTS in_transit (
     dispatched_at TIMESTAMPTZ      NOT NULL,
     failed        BOOLEAN          NOT NULL DEFAULT FALSE,
     PRIMARY KEY (transfer_id, sku, lot_id)
+);
+
+-- One row per (event, transfer line) folded into an in-transit balance's received
+-- quantity, keyed by the event that produced it so a retried arbitration cannot
+-- double-add the same line's qty to the balance.
+CREATE TABLE IF NOT EXISTS transfer_receipts (
+    event_node  TEXT NOT NULL,
+    event_seq   BIGINT NOT NULL,
+    sku         TEXT NOT NULL,
+    lot_id      TEXT NOT NULL,
+    PRIMARY KEY (event_node, event_seq, sku, lot_id)
 );
 
 -- The arbitration audit trail: what central decided about each event, why, and which

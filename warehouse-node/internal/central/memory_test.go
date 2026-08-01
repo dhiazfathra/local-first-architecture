@@ -108,7 +108,7 @@ func TestRecordDispatchUpdatesAnExistingRowsDispatchedQuantity(t *testing.T) {
 	if err := m.RecordDispatch(ctx, row); err != nil {
 		t.Fatalf("RecordDispatch: %v", err)
 	}
-	if err := m.AddReceived(ctx, "T1", key, 2); err != nil {
+	if err := m.AddReceived(ctx, domain.EventID{NodeID: "wh-b", Seq: 1}, "T1", key, 2); err != nil {
 		t.Fatalf("AddReceived: %v", err)
 	}
 	row.Dispatched = 10
@@ -134,7 +134,7 @@ func TestOpenTransfersExcludesEachDisqualifyingCondition(t *testing.T) {
 		ToNode: "wh-b", Dispatched: 5, DispatchedAt: at.Add(-time.Hour)}); err != nil {
 		t.Fatalf("RecordDispatch: %v", err)
 	}
-	if err := m.AddReceived(ctx, "T1", key, 5); err != nil {
+	if err := m.AddReceived(ctx, domain.EventID{NodeID: "wh-b", Seq: 1}, "T1", key, 5); err != nil {
 		t.Fatalf("AddReceived: %v", err)
 	}
 

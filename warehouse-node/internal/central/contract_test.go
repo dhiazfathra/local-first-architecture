@@ -194,6 +194,15 @@ func runStoreContract(t *testing.T, open func(t *testing.T) Store) {
 		if len(other) != 0 {
 			t.Errorf("Outbound(wh-a) = %+v, want empty: the queue is per target", other)
 		}
+
+		// Enqueue is idempotent per (target, event): retrying a crash-interrupted
+		// Arbitrate must not duplicate the outbound entry.
+		if err := s.Enqueue(ctx, "wh-b", envs); err != nil {
+			t.Fatalf("re-Enqueue: %v", err)
+		}
+		if out, err = s.Outbound(ctx, "wh-b", 0, 10); err != nil || len(out) != 2 {
+			t.Fatalf("Outbound after re-Enqueue = %+v, %v; want still exactly 2 rows", out, err)
+		}
 	})
 
 	t.Run("item master round-trips including deletion", func(t *testing.T) {
@@ -327,19 +336,26 @@ func runStoreContract(t *testing.T, open func(t *testing.T) Store) {
 		if got.Dispatched-got.Received != 6 {
 			t.Errorf("in transit = %v, want 6 after dispatch", got.Dispatched-got.Received)
 		}
-		if err := s.AddReceived(ctx, "T1", key, 4); err != nil {
+		if err := s.AddReceived(ctx, domain.EventID{NodeID: "wh-b", Seq: 1}, "T1", key, 4); err != nil {
 			t.Fatalf("AddReceived: %v", err)
 		}
 		if got, _, err = s.InTransit(ctx, "T1", key); err != nil || got.Dispatched-got.Received != 2 {
 			t.Fatalf("in transit after partial receipt = %+v, %v; want 2", got, err)
 		}
-		if err := s.AddReceived(ctx, "T1", key, 2); err != nil {
+		if err := s.AddReceived(ctx, domain.EventID{NodeID: "wh-b", Seq: 2}, "T1", key, 2); err != nil {
 			t.Fatalf("AddReceived: %v", err)
 		}
 		if got, _, err = s.InTransit(ctx, "T1", key); err != nil || got.Dispatched-got.Received != 0 {
 			t.Fatalf("in transit after full receipt = %+v, %v; want 0", got, err)
 		}
-		if err := s.AddReceived(ctx, "T9", key, 1); err == nil {
+		// Retrying the same event is a no-op, not a double-add.
+		if err := s.AddReceived(ctx, domain.EventID{NodeID: "wh-b", Seq: 2}, "T1", key, 2); err != nil {
+			t.Fatalf("AddReceived retry: %v", err)
+		}
+		if got, _, err = s.InTransit(ctx, "T1", key); err != nil || got.Dispatched-got.Received != 0 {
+			t.Fatalf("in transit after retried receipt = %+v, %v; want unchanged at 0", got, err)
+		}
+		if err := s.AddReceived(ctx, domain.EventID{NodeID: "wh-b", Seq: 3}, "T9", key, 1); err == nil {
 			t.Error("AddReceived on an unknown transfer: expected an error")
 		}
 	})
@@ -362,7 +378,7 @@ func runStoreContract(t *testing.T, open func(t *testing.T) Store) {
 		if len(open1) != 1 || open1[0].TransferID != "T1" {
 			t.Fatalf("OpenTransfers = %+v, want only T1: T2 is inside the window", open1)
 		}
-		if err := s.AddReceived(ctx, "T1", key, 6); err != nil {
+		if err := s.AddReceived(ctx, domain.EventID{NodeID: "wh-b", Seq: 1}, "T1", key, 6); err != nil {
 			t.Fatalf("AddReceived: %v", err)
 		}
 		if open1, err = s.OpenTransfers(ctx, at.Add(24*time.Hour)); err != nil || len(open1) != 0 {

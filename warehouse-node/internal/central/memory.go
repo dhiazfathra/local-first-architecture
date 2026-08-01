@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -28,6 +29,8 @@ type Memory struct {
 	nodes     map[domain.NodeID]map[string]bool
 	transit   map[string]InTransitRow
 	decisions map[domain.EventID]Decision
+	enqueued  map[string]bool
+	folded    map[string]bool
 }
 
 // NewMemory returns an empty in-memory store.
@@ -43,6 +46,8 @@ func NewMemory() *Memory {
 		nodes:     map[domain.NodeID]map[string]bool{},
 		transit:   map[string]InTransitRow{},
 		decisions: map[domain.EventID]Decision{},
+		enqueued:  map[string]bool{},
+		folded:    map[string]bool{},
 	}
 }
 
@@ -55,6 +60,17 @@ func poKey(poRef, sku string) string { return poRef + "\x00" + sku }
 
 func transitKey(transferID string, k domain.StockKey) string {
 	return transferID + "\x00" + k.SKU + "\x00" + k.LotID
+}
+
+// eventKey composes the natural key of one (event, SKU/lot) fold or enqueue, so a
+// retry recognizes it already ran.
+func eventKey(id domain.EventID, k domain.StockKey) string {
+	return string(id.NodeID) + "\x00" + strconv.FormatUint(id.Seq, 10) + "\x00" + k.SKU + "\x00" + k.LotID
+}
+
+// enqueueKey composes the natural key of one (target, event) queue entry.
+func enqueueKey(target domain.NodeID, id domain.EventID) string {
+	return string(target) + "\x00" + string(id.NodeID) + "\x00" + strconv.FormatUint(id.Seq, 10)
 }
 
 // Append stores node events idempotently by (node, seq) and returns only those
@@ -161,11 +177,18 @@ func (m *Memory) SetDeliveredOrd(_ context.Context, node domain.NodeID, ord uint
 	return nil
 }
 
-// Enqueue adds events to a node's downstream queue.
+// Enqueue adds events to a node's downstream queue. It is idempotent per (target,
+// event): a retried arbitration that already queued an event for this target is a
+// no-op the second time, rather than duplicating the outbound entry.
 func (m *Memory) Enqueue(_ context.Context, target domain.NodeID, envs []domain.Envelope) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, env := range envs {
+		key := enqueueKey(target, env.ID)
+		if m.enqueued[key] {
+			continue
+		}
+		m.enqueued[key] = true
 		m.nextOrd++
 		m.queue[target] = append(m.queue[target], Outbound{Ord: m.nextOrd, Env: env})
 	}
@@ -313,8 +336,10 @@ func (m *Memory) RecordDispatch(_ context.Context, row InTransitRow) error {
 	return nil
 }
 
-// AddReceived adds to the received quantity of an existing transfer/key.
-func (m *Memory) AddReceived(_ context.Context, transferID string, k domain.StockKey, qty float64) error {
+// AddReceived adds to the received quantity of an existing transfer/key. It is
+// idempotent per (eventID, SKU, lot): a retried arbitration that already folded this
+// event's line into the balance returns nil without adding qty again.
+func (m *Memory) AddReceived(_ context.Context, eventID domain.EventID, transferID string, k domain.StockKey, qty float64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := transitKey(transferID, k)
@@ -322,6 +347,11 @@ func (m *Memory) AddReceived(_ context.Context, transferID string, k domain.Stoc
 	if !ok {
 		return fmt.Errorf("transfer %s has no dispatched line for %s/%s", transferID, k.SKU, k.LotID)
 	}
+	fk := eventKey(eventID, k)
+	if m.folded[fk] {
+		return nil // already folded into the balance by an earlier attempt
+	}
+	m.folded[fk] = true
 	row.Received += qty
 	m.transit[key] = row
 	return nil
