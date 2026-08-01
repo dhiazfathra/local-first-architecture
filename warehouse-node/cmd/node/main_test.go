@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"io"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,6 +130,15 @@ func TestRunRejectsBadConfiguration(t *testing.T) {
 	}
 }
 
+func TestRunFailsWhenListenerIsClosed(t *testing.T) {
+	lis := bufconn.Listen(1 << 10)
+	_ = lis.Close()
+	cfg := Config{DB: filepath.Join(t.TempDir(), "node.db"), ID: "wh-a"}
+	if err := run(context.Background(), cfg, lis); err == nil {
+		t.Fatal("run with closed listener: expected an error")
+	}
+}
+
 func TestParseLocations(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -160,5 +172,46 @@ func TestParseLocations(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMainReportsErrorsAndExitsNonzero(t *testing.T) {
+	oldArgs, oldExit, oldStderr := os.Args, osExit, os.Stderr
+	defer func() { os.Args, osExit, os.Stderr = oldArgs, oldExit, oldStderr }()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	os.Args = []string{"node", "--db", "missing/dir/node.db", "--id", "wh-a"}
+	var gotCode int
+	osExit = func(code int) { gotCode = code }
+
+	main()
+
+	_ = w.Close()
+	stderr, _ := io.ReadAll(r)
+	if gotCode != 1 {
+		t.Errorf("exit code = %d, want 1", gotCode)
+	}
+	if !strings.Contains(string(stderr), "node:") {
+		t.Errorf("stderr = %q, want it prefixed with %q", stderr, "node:")
+	}
+}
+
+func TestMainReportsParseLocationsErrors(t *testing.T) {
+	oldArgs, oldExit := os.Args, osExit
+	defer func() { os.Args, osExit = oldArgs, oldExit }()
+
+	os.Args = []string{"node", "--db", filepath.Join(t.TempDir(), "node.db"),
+		"--id", "wh-a", "--locations", "INVALID"}
+	var gotCode int
+	osExit = func(code int) { gotCode = code }
+
+	main()
+
+	if gotCode != 1 {
+		t.Errorf("exit code = %d, want 1", gotCode)
 	}
 }

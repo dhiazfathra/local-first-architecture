@@ -8,8 +8,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -35,33 +35,46 @@ type Config struct {
 	Locations map[domain.LocationCode]domain.LocationType
 }
 
+// osExit is os.Exit, swappable in tests so main can run to completion
+// in-process instead of terminating the test binary.
+var osExit = os.Exit
+
 func main() {
+	if err := realMain(); err != nil {
+		fmt.Fprintf(os.Stderr, "node: %v\n", err)
+		osExit(1)
+	}
+}
+
+// realMain parses flags, builds the listener, and calls run.
+func realMain() error {
+	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	var cfg Config
 	var id, locations string
-	flag.StringVar(&cfg.DB, "db", "node.db", "path to this node's SQLite event log")
-	flag.StringVar(&id, "id", "", "this node's identity, e.g. wh-a")
-	flag.StringVar(&cfg.Central, "central", "", "central's address; empty means run offline")
-	flag.DurationVar(&cfg.SyncEvery, "sync-every", 5*time.Second, "interval between sync sessions")
-	flag.DurationVar(&cfg.Backoff, "backoff", 30*time.Second, "wait after a failed sync session")
-	flag.StringVar(&locations, "locations", "",
+	fs.StringVar(&cfg.DB, "db", "node.db", "path to this node's SQLite event log")
+	fs.StringVar(&id, "id", "", "this node's identity, e.g. wh-a")
+	fs.StringVar(&cfg.Central, "central", "", "central's address; empty means run offline")
+	fs.DurationVar(&cfg.SyncEvery, "sync-every", 5*time.Second, "interval between sync sessions")
+	fs.DurationVar(&cfg.Backoff, "backoff", 30*time.Second, "wait after a failed sync session")
+	fs.StringVar(&locations, "locations", "",
 		"comma-separated code:type pairs to register on startup, e.g. RECV-01:receiving,PICK-01:pick")
-	listen := flag.String("listen", ":8080", "address to serve the operator API on")
-	flag.Parse()
+	listen := fs.String("listen", ":8080", "address to serve the operator API on")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
 
 	cfg.ID = domain.NodeID(id)
 	parsed, err := parseLocations(locations)
 	if err != nil {
-		log.Fatalf("node: %v", err)
+		return err
 	}
 	cfg.Locations = parsed
 
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {
-		log.Fatalf("node: listen on %s: %v", *listen, err)
+		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
-	if err := run(context.Background(), cfg, lis); err != nil {
-		log.Fatalf("node: %v", err)
-	}
+	return run(context.Background(), cfg, lis)
 }
 
 // parseLocations turns the -locations flag into the map run expects.
