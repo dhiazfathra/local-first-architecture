@@ -529,6 +529,22 @@ func TestInsertFailsWhenPrepareFailsIndependentlyOfBegin(t *testing.T) {
 	}
 }
 
+func TestEmitFailsRatherThanDiscardOnConflict(t *testing.T) {
+	// Emit assigns a fresh local sequence and should never collide. If the target
+	// row is somehow already occupied, Emit must error rather than silently drop
+	// the event via ON CONFLICT DO NOTHING (which is Ingest's replay semantics).
+	l := openLog(t, "wh-a")
+	if _, err := l.DB().Exec(`INSERT INTO events
+		(node_id, seq, aggregate_id, type, hlc_wall, hlc_counter, hlc_node, recorded_at, payload)
+		VALUES ('wh-a', 1, 'WIDGET', ?, 0, 0, 'wh-a', ?, '{}')`,
+		string(domain.TypePutAway), time.Unix(0, 0).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed conflicting row: %v", err)
+	}
+	if _, err := l.Emit([]domain.Event{putAway(1)}, nil); err == nil {
+		t.Fatal("expected Emit to error on a conflicting (node_id, seq)")
+	}
+}
+
 func TestOpenFailsOnACorruptDatabaseFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "node.db")
 	if err := os.WriteFile(path, []byte("not a sqlite database"), 0o600); err != nil {

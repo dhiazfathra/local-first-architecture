@@ -43,9 +43,9 @@ CREATE TABLE IF NOT EXISTS projection_version (
 `
 
 // Cursor names. Pushed is the highest sequence of this node's own events that
-// central has acknowledged; Pulled is the highest count of events accepted from
-// central. Persisting both is what makes the sync stream resumable after a week
-// offline rather than restarting from zero.
+// central has acknowledged; Pulled is central's outbound ordinal (last_ord) up to
+// which this node has accepted events, not a count. Persisting both is what makes
+// the sync stream resumable after a week offline rather than restarting from zero.
 const (
 	CursorPushed = "pushed_to_central"
 	CursorPulled = "pulled_from_central"

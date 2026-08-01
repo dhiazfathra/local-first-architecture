@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,11 +29,18 @@ type Log struct {
 // Open opens or creates the log at path. now supplies wall time; it is injected so
 // tests are deterministic and so no other package needs to reach for time.Now.
 func Open(path string, nodeID domain.NodeID, now func() time.Time) (*Log, error) {
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)"
+	dsn := path + "?" + strings.Join([]string{
+		"_pragma=journal_mode(WAL)",
+		"_pragma=busy_timeout(5000)",
+		"_pragma=synchronous(FULL)",
+	}, "&")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite at %s: %w", path, err)
 	}
+	// One writer at a time: Emit/Ingest already serialize under l.mu, and a pooled
+	// sql.DB would otherwise let SQLite operations run concurrently on this file.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, errors.Join(fmt.Errorf("apply schema: %w", err), db.Close())
 	}
@@ -94,7 +102,7 @@ func (l *Log) Emit(events []domain.Event, causation *domain.EventID) ([]domain.E
 		}
 		envs = append(envs, env)
 	}
-	if err := l.insert(envs); err != nil {
+	if _, err := l.insert(envs, false); err != nil {
 		return nil, err
 	}
 	l.seq, l.clock = seq, clock
@@ -116,69 +124,72 @@ func (l *Log) Ingest(envs []domain.Envelope) (int, error) {
 		// after seeing these events sorts after them.
 		clock = domain.Merge(clock, e.HLC, nowMillis, l.nodeID)
 	}
-	before, err := l.countEvents()
-	if err != nil {
-		return 0, err
-	}
-	if err := l.insert(envs); err != nil {
-		return 0, err
-	}
-	after, err := l.countEvents()
+	added, err := l.insert(envs, true)
 	if err != nil {
 		return 0, err
 	}
 	l.clock = clock
 	// If any of the ingested events came from this node (a resend of our own
 	// events echoed back), keep the sequence counter ahead of them.
-	if seq, err := l.highestSeqLocked(l.nodeID); err == nil && seq > l.seq {
+	seq, err := l.highestSeq(l.nodeID)
+	if err != nil {
+		return 0, err
+	}
+	if seq > l.seq {
 		l.seq = seq
 	}
-	return after - before, nil
+	return added, nil
 }
 
-// insert writes envelopes in a single transaction, ignoring any whose (node_id, seq)
-// is already stored.
-func (l *Log) insert(envs []domain.Envelope) error {
+// insert writes envelopes in a single transaction, reporting how many rows were
+// newly added. When ignoreConflicts is true, an envelope whose (node_id, seq) is
+// already stored is skipped rather than erroring — Ingest tolerates and expects
+// replayed events; Emit assigns a fresh local sequence and should never conflict,
+// so a conflict there surfaces as an error instead of being silently discarded.
+func (l *Log) insert(envs []domain.Envelope, ignoreConflicts bool) (int, error) {
 	tx, err := l.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+		return 0, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // no-op once committed
 
-	stmt, err := tx.Prepare(`
+	query := `
 		INSERT INTO events (node_id, seq, aggregate_id, type, hlc_wall, hlc_counter, hlc_node,
 		                    recorded_at, causation_node, causation_seq, payload)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (node_id, seq) DO NOTHING`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	if ignoreConflicts {
+		query += `
+		ON CONFLICT (node_id, seq) DO NOTHING`
+	}
+	stmt, err := tx.Prepare(query)
 	if err != nil {
-		return fmt.Errorf("prepare insert: %w", err)
+		return 0, fmt.Errorf("prepare insert: %w", err)
 	}
 	defer func() { _ = stmt.Close() }()
 
+	var added int64
 	for _, e := range envs {
 		var causeNode any
 		var causeSeq any
 		if e.CausationID != nil {
 			causeNode, causeSeq = string(e.CausationID.NodeID), e.CausationID.Seq
 		}
-		if _, err := stmt.Exec(string(e.ID.NodeID), e.ID.Seq, e.AggregateID, e.Type,
+		res, err := stmt.Exec(string(e.ID.NodeID), e.ID.Seq, e.AggregateID, e.Type,
 			e.HLC.Wall, e.HLC.Counter, string(e.HLC.Node),
-			e.RecordedAt.UTC().Format(time.RFC3339Nano), causeNode, causeSeq, []byte(e.Payload)); err != nil {
-			return fmt.Errorf("append %s: %w", e.ID, err)
+			e.RecordedAt.UTC().Format(time.RFC3339Nano), causeNode, causeSeq, []byte(e.Payload))
+		if err != nil {
+			return 0, fmt.Errorf("append %s: %w", e.ID, err)
 		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("rows affected for %s: %w", e.ID, err)
+		}
+		added += n
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return 0, fmt.Errorf("commit: %w", err)
 	}
-	return nil
-}
-
-func (l *Log) countEvents() (int, error) {
-	var n int
-	if err := l.db.QueryRow(`SELECT count(*) FROM events`).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count events: %w", err)
-	}
-	return n, nil
+	return int(added), nil
 }
 
 const selectColumns = `node_id, seq, aggregate_id, type, hlc_wall, hlc_counter, hlc_node,
@@ -240,10 +251,10 @@ func (l *Log) query(q string, args ...any) ([]domain.Envelope, error) {
 
 // HighestSeq is the highest sequence number stored for node, or zero if none.
 func (l *Log) HighestSeq(node domain.NodeID) (uint64, error) {
-	return l.highestSeqLocked(node)
+	return l.highestSeq(node)
 }
 
-func (l *Log) highestSeqLocked(node domain.NodeID) (uint64, error) {
+func (l *Log) highestSeq(node domain.NodeID) (uint64, error) {
 	var seq sql.NullInt64
 	if err := l.db.QueryRow(`SELECT max(seq) FROM events WHERE node_id = ?`, string(node)).Scan(&seq); err != nil {
 		return 0, fmt.Errorf("highest seq for %s: %w", node, err)
