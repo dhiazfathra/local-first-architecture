@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package warehouse.sync.v1;
+
+option go_package = "github.com/dhiazfathra/local-first-architecture/warehouse-node/proto/syncpb;syncpb";
+
+// EventID is an event's global identity: the node that produced it and that node's
+// own monotonic sequence number.
+message EventID {
+  string node_id = 1;
+  uint64 seq = 2;
+}
+
+// HLC is a hybrid logical clock reading. It orders events across nodes without
+// requiring their wall clocks to agree.
+message HLC {
+  int64 wall = 1;
+  uint32 counter = 2;
+  string node = 3;
+}
+
+// Event is one envelope on the wire. causation_id is set only on compensating events
+// emitted by central, and names the event being compensated.
+message Event {
+  EventID id = 1;
+  string aggregate_id = 2;
+  string type = 3;
+  HLC hlc = 4;
+  int64 recorded_at_unix_nano = 5;
+  EventID causation_id = 6;
+  bytes payload = 7;
+}
+
+// EventBatch is one bounded chunk. more is true when the sender has further events
+// ready, which lets the receiver keep asking without guessing. last_ord is set only
+// on batches central sends down, and is the outbound position of the final event in
+// the batch — what the node acknowledges and persists as its pull cursor.
+message EventBatch {
+  repeated Event events = 1;
+  bool more = 2;
+  uint64 last_ord = 3;
+}
+
+// Hello opens a session. version_vector is the highest sequence the node holds per
+// originating node, so central can tell what it still needs to send.
+message Hello {
+  string node_id = 1;
+  map<string, uint64> version_vector = 2;
+  uint64 pulled_cursor = 3;
+}
+
+// Welcome answers Hello with the highest sequence central holds for this node, so
+// the node knows where to resume pushing from.
+message Welcome {
+  uint64 known_seq = 1;
+}
+
+// Ack confirms durability. seq is the highest sequence of the node's own events that
+// central has persisted; ord is the highest downstream position the node has applied.
+message Ack {
+  uint64 seq = 1;
+  uint64 ord = 2;
+}
+
+message NodeFrame {
+  oneof body {
+    Hello hello = 1;
+    EventBatch events = 2;
+    Ack ack = 3;
+  }
+}
+
+message CentralFrame {
+  oneof body {
+    Welcome welcome = 1;
+    EventBatch events = 2;
+    Ack ack = 3;
+  }
+}
+
+// Sync replicates events in both directions over one stream. The node always opens
+// it, because the node may be behind a connection central cannot dial.
+service Sync {
+  rpc Replicate(stream NodeFrame) returns (stream CentralFrame);
+}
