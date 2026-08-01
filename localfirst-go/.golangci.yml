@@ -1,0 +1,17 @@
+version: "2"
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - misspell
+formatters:
+  enable:
+    - gofmt
+issues:
+  exclude-rules:
+    - path: syncpb/
+      linters: [revive, staticcheck]
