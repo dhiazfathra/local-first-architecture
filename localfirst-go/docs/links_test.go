@@ -18,6 +18,7 @@ var required = []string{
 	"docs/adr/0004-symmetric-sync-protocol.md",
 	"docs/adr/0005-domain-agnostic-engine.md",
 	"docs/architecture.md",
+	"docs/swapping-the-domain.md",
 }
 
 // root is the module root; this test file lives in docs/.
