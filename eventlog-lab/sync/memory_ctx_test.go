@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/sync/syncpb"
@@ -27,18 +28,18 @@ func TestMemPipeUnblocksOnContextCancellation(t *testing.T) {
 	cs := (*memClientSide)(p)
 	ss := (*memServerSide)(p)
 
-	if _, err := cs.Recv(); err == nil {
-		t.Fatal("memClientSide.Recv() error = nil, want context error")
+	if _, err := cs.Recv(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("memClientSide.Recv() error = %v, want context.Canceled", err)
 	}
 	hello := &syncpb.ClientFrame{Body: &syncpb.ClientFrame_Hello{Hello: &syncpb.Hello{NodeId: "A"}}}
-	if err := cs.Send(hello); err == nil {
-		t.Fatal("memClientSide.Send() error = nil, want context error")
+	if err := cs.Send(hello); !errors.Is(err, context.Canceled) {
+		t.Fatalf("memClientSide.Send() error = %v, want context.Canceled", err)
 	}
-	if _, err := ss.Recv(); err == nil {
-		t.Fatal("memServerSide.Recv() error = nil, want context error")
+	if _, err := ss.Recv(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("memServerSide.Recv() error = %v, want context.Canceled", err)
 	}
 	ack := &syncpb.ServerFrame{Body: &syncpb.ServerFrame_Ack{Ack: &syncpb.Ack{}}}
-	if err := ss.Send(ack); err == nil {
-		t.Fatal("memServerSide.Send() error = nil, want context error")
+	if err := ss.Send(ack); !errors.Is(err, context.Canceled) {
+		t.Fatalf("memServerSide.Send() error = %v, want context.Canceled", err)
 	}
 }

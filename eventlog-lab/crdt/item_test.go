@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
-	"path/filepath"
 	"testing"
 
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
@@ -146,38 +145,9 @@ func TestApplyMetaAndDelete(t *testing.T) {
 	}
 }
 
-// TestApplyIsNotIdempotentButTheLogPathIs is the test the spec demands: it
-// shows the direct path double-counts a duplicate, and the log path does not,
-// because idempotence comes from Append's primary key, never from Apply.
-func TestApplyIsNotIdempotentButTheLogPathIs(t *testing.T) {
-	ctx := context.Background()
-	e := qty("A", 1, 100, 7)
-
-	direct := NewItemState()
-	direct.Apply(e)
-	direct.Apply(e)
-	if direct.Quantity() != 14 {
-		t.Fatalf("direct double-apply Quantity() = %d, want 14 -- Apply is documented as NOT idempotent", direct.Quantity())
-	}
-
-	l, err := eventlog.OpenSQLite(filepath.Join(t.TempDir(), "dup.db"))
-	if err != nil {
-		t.Fatalf("OpenSQLite() error = %v", err)
-	}
-	defer func() { _ = l.Close() }()
-	for i := 0; i < 2; i++ {
-		if err := l.Append(ctx, e); err != nil {
-			t.Fatalf("Append() error = %v", err)
-		}
-	}
-	viaLog := NewItemState()
-	if err := viaLog.Fold(l.EventsForSKU(ctx, "SKU-1", eventlog.VersionVector{})); err != nil {
-		t.Fatalf("Fold() error = %v", err)
-	}
-	if viaLog.Quantity() != 7 {
-		t.Fatalf("log-path Quantity() = %d after duplicate delivery, want 7", viaLog.Quantity())
-	}
-}
+// The direct-Apply-double-counts-but-the-log-path-doesn't property is
+// covered by TestDuplicateThroughLogIsAbsorbedButDirectApplyDoubleCounts in
+// replay_test.go, next to the replay determinism test.
 
 func TestFoldSurfacesIterationError(t *testing.T) {
 	wantErr := context.Canceled

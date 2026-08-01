@@ -114,14 +114,23 @@ func (c *Cluster) ApplyOp(ctx context.Context, op Op) (eventlog.EventID, error) 
 // arrives on the channel it's waiting on. This is what makes "a partition
 // should break the stream" (see SyncRound) actually true rather than a
 // deadlock.
-const syncSessionTimeout = 500 * time.Millisecond
+//
+// 2s rather than 500ms: a loaded CI runner (or -race, which slows SQLite I/O
+// considerably) can make a healthy session take longer than a few hundred
+// milliseconds, which would otherwise misreport a slow-but-healthy session as
+// a partition.
+const syncSessionTimeout = 2 * time.Second
 
 // SyncPair runs one client session from a to b. A session failing during a
 // partition is expected, so the error is returned for the caller to ignore.
 func (c *Cluster) SyncPair(ctx context.Context, from, to clock.NodeID) error {
+	n, ok := c.Nodes[from]
+	if !ok {
+		return fmt.Errorf("unknown node %q", from)
+	}
 	ctx, cancel := context.WithTimeout(ctx, syncSessionTimeout)
 	defer cancel()
-	cl := syncpkg.NewClient(c.Nodes[from], c.Trans, syncBatchSize)
+	cl := syncpkg.NewClient(n, c.Trans, syncBatchSize)
 	if _, err := cl.SyncOnce(ctx, string(to)); err != nil {
 		return fmt.Errorf("sync %q -> %q: %w", from, to, err)
 	}
@@ -164,19 +173,19 @@ func (c *Cluster) syncOrder() []clock.NodeID {
 // Quiesce heals every partition and syncs full mesh until all nodes hold the
 // same version vector. It returns an error rather than giving up silently: a
 // harness that quietly stops syncing reports false convergence.
-func (c *Cluster) Quiesce(ctx context.Context, maxRounds int) error {
+func (c *Cluster) Quiesce(ctx context.Context, maxRounds int) (int, error) {
 	c.Inj.Heal()
 	for round := 0; round < maxRounds; round++ {
 		c.SyncRound(ctx)
 		same, err := c.vectorsAgree(ctx)
 		if err != nil {
-			return err
+			return round + 1, err
 		}
 		if same {
-			return nil
+			return round + 1, nil
 		}
 	}
-	return fmt.Errorf("no quiescence after %d rounds", maxRounds)
+	return maxRounds, fmt.Errorf("no quiescence after %d rounds", maxRounds)
 }
 
 // vectorsAgree reports whether every node holds the same version vector.
@@ -407,14 +416,14 @@ func Run(ctx context.Context, dir string, sch Schedule, f Faults) (Result, error
 			fi++
 		}
 		id, err := c.ApplyOp(ctx, op)
-		if err != nil {
+		if err == nil {
+			res.Acked++
+			acked = append(acked, id)
+		} else {
 			// Not acknowledged, so no guarantee attaches to it. This is the
 			// crash fault's normal outcome, not a failure.
 			res.Failed++
-			continue
 		}
-		res.Acked++
-		acked = append(acked, id)
 		if sch.SyncEvery > 0 && i%sch.SyncEvery == sch.SyncEvery-1 {
 			c.SyncRound(ctx)
 			res.Rounds++
@@ -422,10 +431,11 @@ func Run(ctx context.Context, dir string, sch Schedule, f Faults) (Result, error
 	}
 
 	quiesceRounds := 4 * (len(c.IDs) + 1)
-	if err := c.Quiesce(ctx, quiesceRounds); err != nil {
+	ran, err := c.Quiesce(ctx, quiesceRounds)
+	if err != nil {
 		return res, fmt.Errorf("seed %d: %w", sch.Seed, err)
 	}
-	res.Rounds += quiesceRounds
+	res.Rounds += ran
 
 	for _, id := range c.IDs {
 		res.Crashes += c.Logs[id].Crashes()

@@ -32,7 +32,7 @@ func TestConcurrentPickBelowZeroConvergesToNegativeSix(t *testing.T) {
 	if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 10}); err != nil {
 		t.Fatalf("Receive(10) error = %v", err)
 	}
-	if err := c.Quiesce(ctx, 8); err != nil {
+	if _, err := c.Quiesce(ctx, 8); err != nil {
 		t.Fatalf("Quiesce() error = %v", err)
 	}
 	for _, id := range c.IDs {
@@ -69,7 +69,7 @@ func TestConcurrentPickBelowZeroConvergesToNegativeSix(t *testing.T) {
 	}
 
 	// Heal and converge.
-	if err := c.Quiesce(ctx, 16); err != nil {
+	if _, err := c.Quiesce(ctx, 16); err != nil {
 		t.Fatalf("Quiesce() after heal error = %v", err)
 	}
 	for _, id := range c.IDs {

@@ -15,6 +15,7 @@ package crdt
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
@@ -76,11 +77,22 @@ func TestPostgresAnomaliesReportNegativeStockWithoutRejectingIt(t *testing.T) {
 		}
 	}
 
-	got, err := l.Anomalies(ctx)
+	all, err := l.Anomalies(ctx)
 	if err != nil {
 		t.Fatalf("Anomalies() error = %v", err)
 	}
+	// Anomalies() reports every negative projection in the shared table, not
+	// just this test's. Running against a live database alongside other
+	// packages (e.g. eventlog/postgres_test.go's TRUNCATE) means unrelated
+	// rows can appear or this test's rows can be raced out from under it, so
+	// scope the assertion to this test's own SKU namespace.
+	var got []eventlog.Anomaly
+	for _, a := range all {
+		if strings.HasPrefix(a.SKU, "ANOM-") {
+			got = append(got, a)
+		}
+	}
 	if len(got) != 1 || got[0].SKU != "ANOM-SKU-1" || got[0].Quantity != -6 {
-		t.Fatalf("Anomalies() = %+v, want exactly [{ANOM-SKU-1 -6}]", got)
+		t.Fatalf("Anomalies() (ANOM- namespace) = %+v, want exactly [{ANOM-SKU-1 -6}]", got)
 	}
 }

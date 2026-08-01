@@ -17,11 +17,6 @@ coverage.*
 *.coverprofile
 profile.cov
 
-# stray sqlite files left by cmd/lab test cases that pass a literal path
-*.db
-*.db-shm
-*.db-wal
-
 # Dependency directories (remove the comment below to include it)
 # vendor/
 

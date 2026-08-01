@@ -15,6 +15,9 @@ import (
 // deliver: none (a drop), the same one (pass-through), or several (a duplicate).
 // The fault harness installs a filter to inject partitions, duplication, and
 // reordering; the default filter passes everything through.
+//
+// A filter must be safe for concurrent use: both directions of a pipe can
+// invoke it on separate goroutines at the same time.
 type FrameFilter func(from, to clock.NodeID, frame any) []any
 
 // MemoryTransport wires clients and servers together in-process with no real
@@ -37,7 +40,9 @@ func (m *MemoryTransport) Serve(addr string, srv *Server) {
 	m.servers[addr] = srv
 }
 
-// SetFilter installs a frame filter. Passing nil restores pass-through.
+// SetFilter installs a frame filter for sessions opened after this call.
+// Sessions already open keep the filter they captured at Dial time. Passing
+// nil restores pass-through.
 func (m *MemoryTransport) SetFilter(f FrameFilter) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -141,6 +146,10 @@ func (s *memClientSide) CloseSend() error {
 	}
 	return nil
 }
+
+// Close is a no-op: the in-memory transport holds no resource beyond the
+// channels and goroutine already released by CloseSend or ctx cancellation.
+func (s *memClientSide) Close() error { return nil }
 
 type memServerSide memPipe
 

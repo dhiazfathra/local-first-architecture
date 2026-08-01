@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -28,6 +29,10 @@ func execCLI(t *testing.T, args ...string) (string, string, error) {
 }
 
 func TestRunUsageErrors(t *testing.T) {
+	// op unknown verb reaches openNode (its args parse cleanly before the
+	// unknown-verb check), so it needs a real, isolated path rather than a
+	// literal name that would create a stray file in the working directory.
+	opUnknownVerbDB := filepath.Join(t.TempDir(), "op-unknown-verb.db")
 	tests := []struct {
 		name    string
 		args    []string
@@ -39,7 +44,7 @@ func TestRunUsageErrors(t *testing.T) {
 		{name: "op without db", args: []string{"op", "--id", "A", "receive", "SKU-1", "10"}, wantMsg: "--db"},
 		{
 			name:    "op unknown verb",
-			args:    []string{"op", "--id", "A", "--db", "x.db", "teleport", "SKU-1", "1"},
+			args:    []string{"op", "--id", "A", "--db", opUnknownVerbDB, "teleport", "SKU-1", "1"},
 			wantMsg: "unknown op",
 		},
 		{
@@ -231,7 +236,7 @@ func TestNodeListenAddressInUseFailsFast(t *testing.T) {
 }
 
 // startPeer serves replication over a real gRPC listener and returns its
-// address. The caller must close the returned log.
+// address. The server and the backing log are closed by t.Cleanup.
 func startPeer(t *testing.T) (addr string) {
 	t.Helper()
 	db := filepath.Join(t.TempDir(), "peer.db")
@@ -277,12 +282,22 @@ func TestNodeOnceSyncsSuccessfully(t *testing.T) {
 // unit test cannot run to completion.
 func runInterruptibly(t *testing.T, args ...string) (string, string, error) {
 	t.Helper()
+	// Keep a handler installed for the whole test so a SIGINT that races the
+	// command's own handler cannot terminate the test binary.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT)
+	t.Cleanup(func() { signal.Stop(sigs) })
 	var out, errOut bytes.Buffer
 	done := make(chan error, 1)
 	go func() { done <- run(args, &out, &errOut) }()
+	stop := make(chan struct{})
+	defer close(stop)
 	go func() {
-		time.Sleep(150 * time.Millisecond)
-		_ = syscall.Kill(os.Getpid(), syscall.SIGINT)
+		select {
+		case <-time.After(150 * time.Millisecond):
+			_ = syscall.Kill(os.Getpid(), syscall.SIGINT)
+		case <-stop:
+		}
 	}()
 	select {
 	case err := <-done:
@@ -319,17 +334,7 @@ func TestNodeSyncFailureIsLoggedAndRetried(t *testing.T) {
 }
 
 func TestSimTempDirFailure(t *testing.T) {
-	old, hadOld := os.LookupEnv("TMPDIR")
-	t.Cleanup(func() {
-		if hadOld {
-			_ = os.Setenv("TMPDIR", old)
-		} else {
-			_ = os.Unsetenv("TMPDIR")
-		}
-	})
-	if err := os.Setenv("TMPDIR", filepath.Join(t.TempDir(), "does-not-exist")); err != nil {
-		t.Fatalf("setenv TMPDIR: %v", err)
-	}
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "does-not-exist"))
 	if _, _, err := execCLI(t, "sim", "--seed", "1", "--nodes", "2", "--ops", "5"); err == nil {
 		t.Fatalf("sim with an unusable TMPDIR = nil, want error")
 	}

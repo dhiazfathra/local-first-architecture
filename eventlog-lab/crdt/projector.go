@@ -66,10 +66,13 @@ func (p *Projector) MaybeSnapshot(ctx context.Context, sku string) error {
 		return nil
 	}
 
-	// ponytail: re-folds the SKU's whole history on every trigger, so
-	// snapshotting a SKU is O(n^2) over its lifetime. Performance is an
-	// explicit non-goal here; if this ever shows up in a profile, fold from
-	// the existing snapshot forward instead of from identity.
+	// Fold from the existing snapshot forward, not from identity: Compact
+	// deletes rows once a snapshot covers them, so after the first
+	// compaction the surviving rows are no longer this SKU's whole history.
+	// Refolding from identity over only the surviving rows would silently
+	// replace a correct snapshot with one missing every compacted delta,
+	// and Project could never recover them because the rows are gone.
+	//
 	// Seq is allocated per node across the whole log, not per SKU, so a gap
 	// in this SKU's own seq sequence is normal (another SKU's event used
 	// that number) and is NOT evidence of a missing event. The only source
@@ -91,7 +94,17 @@ func (p *Projector) MaybeSnapshot(ctx context.Context, sku string) error {
 	}
 	state := NewItemState()
 	covers := eventlog.VersionVector{}
-	for e, err := range p.Log.EventsForSKU(ctx, sku, eventlog.VersionVector{}) {
+	blob, snapVV, err := p.Log.LoadSnapshot(ctx, sku)
+	switch {
+	case err == nil:
+		if state, err = Unmarshal(blob); err != nil {
+			return fmt.Errorf("snapshot %q: %w", sku, err)
+		}
+		covers = snapVV.Clone()
+	case !errors.Is(err, eventlog.ErrNoSnapshot):
+		return fmt.Errorf("snapshot %q: %w", sku, err)
+	}
+	for e, err := range p.Log.EventsForSKU(ctx, sku, covers) {
 		if err != nil {
 			return fmt.Errorf("snapshot %q: %w", sku, err)
 		}
@@ -103,6 +116,6 @@ func (p *Projector) MaybeSnapshot(ctx context.Context, sku string) error {
 	}
 	// Marshal's error return is unreachable for an *ItemState (see its doc
 	// comment): discard rather than leave a permanent coverage gap.
-	blob, _ := Marshal(state)
+	blob, _ = Marshal(state)
 	return p.Log.SaveSnapshot(ctx, sku, blob, covers)
 }

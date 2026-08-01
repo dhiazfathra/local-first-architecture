@@ -1,7 +1,6 @@
 package crdt
 
 import (
-	"fmt"
 	"math/rand"
 	"testing"
 
@@ -138,10 +137,12 @@ func TestApplyIsAssociativeAcrossPartitionedSubsets(t *testing.T) {
 	var want *ItemState
 	for split := 0; split <= len(events); split++ {
 		got := NewItemState()
-		for _, e := range events[:split] {
+		// Fold the tail group first, then the head group: the grouping
+		// changes the total order, so an order-dependent Apply diverges.
+		for _, e := range events[split:] {
 			got.Apply(e)
 		}
-		for _, e := range events[split:] {
+		for _, e := range events[:split] {
 			got.Apply(e)
 		}
 		if want == nil {
@@ -152,8 +153,5 @@ func TestApplyIsAssociativeAcrossPartitionedSubsets(t *testing.T) {
 			t.Fatalf("split at %d diverged: quantity %d, want %d",
 				split, got.Quantity(), want.Quantity())
 		}
-	}
-	if got := fmt.Sprintf("%d", want.Quantity()); got == "" {
-		t.Fatal("unreachable")
 	}
 }

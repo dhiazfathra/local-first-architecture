@@ -136,6 +136,7 @@ func TestServerSessionSurfacesReplicaErrors(t *testing.T) {
 		srv       func() *Server
 		in        []*syncpb.ClientFrame
 		sendFailN int
+		recvFails bool
 	}{
 		{
 			name: "cursor lookup fails",
@@ -211,7 +212,8 @@ func TestServerSessionSurfacesReplicaErrors(t *testing.T) {
 			srv: func() *Server {
 				return NewServer(&fakeReplica{id: "B", log: &fakeLog{}}, 8)
 			},
-			in: hello,
+			in:        hello,
+			recvFails: true,
 		},
 	}
 	for _, tt := range tests {
@@ -219,7 +221,7 @@ func TestServerSessionSurfacesReplicaErrors(t *testing.T) {
 			var st ServerStream
 			if tt.sendFailN > 0 {
 				st = &failNTimesStream{in: tt.in, sendN: tt.sendFailN, sendErr: boom}
-			} else if tt.name == "recv after hello fails" {
+			} else if tt.recvFails {
 				st = &recvFailAfterStream{in: tt.in, failAfter: len(tt.in)}
 			} else {
 				st = &scriptedServerStream{in: tt.in}
@@ -324,6 +326,7 @@ func (s *scriptedClientStream) Recv() (*syncpb.ServerFrame, error) {
 }
 
 func (s *scriptedClientStream) CloseSend() error { return s.closeErr }
+func (s *scriptedClientStream) Close() error     { return nil }
 
 type stubDialer struct {
 	st  Stream
@@ -443,6 +446,7 @@ type recvFailAfterClientStream struct {
 
 func (s *recvFailAfterClientStream) Send(*syncpb.ClientFrame) error { return nil }
 func (s *recvFailAfterClientStream) CloseSend() error               { return nil }
+func (s *recvFailAfterClientStream) Close() error                   { return nil }
 func (s *recvFailAfterClientStream) Recv() (*syncpb.ServerFrame, error) {
 	if s.i < len(s.in) {
 		f := s.in[s.i]

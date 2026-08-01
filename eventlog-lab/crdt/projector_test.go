@@ -130,6 +130,46 @@ func TestMaybeSnapshotClampsCoversToGapFreePrefix(t *testing.T) {
 	}
 }
 
+// TestMaybeSnapshotSurvivesCompactByFoldingForward guards against refolding
+// from identity over only the rows Compact left behind: a re-snapshot after
+// compaction must not lose the quantity contributed by already-compacted
+// events.
+func TestMaybeSnapshotSurvivesCompactByFoldingForward(t *testing.T) {
+	ctx := context.Background()
+	p, l := newProjector(t, 2)
+	if err := l.Append(ctx, qty("A", 1, 10, 10)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if err := l.Append(ctx, qty("A", 2, 20, 5)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if err := p.MaybeSnapshot(ctx, "SKU-1"); err != nil {
+		t.Fatalf("MaybeSnapshot() error = %v", err)
+	}
+	// Compact deletes the two events now that the snapshot covers them.
+	if err := l.Compact(ctx, eventlog.VersionVector{"A": 2}); err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+	// More events for the same SKU push it over the threshold again, so
+	// MaybeSnapshot fires with only these new rows still in the log.
+	if err := l.Append(ctx, qty("A", 3, 30, 1)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if err := l.Append(ctx, qty("A", 4, 40, 1)); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if err := p.MaybeSnapshot(ctx, "SKU-1"); err != nil {
+		t.Fatalf("MaybeSnapshot() error = %v", err)
+	}
+	got, err := p.Project(ctx, "SKU-1")
+	if err != nil {
+		t.Fatalf("Project() error = %v", err)
+	}
+	if want := int64(10 + 5 + 1 + 1); got.Quantity() != want {
+		t.Fatalf("Quantity() = %d, want %d (compacted history must survive a later re-snapshot)", got.Quantity(), want)
+	}
+}
+
 func TestProjectRejectsCorruptSnapshotState(t *testing.T) {
 	ctx := context.Background()
 	p, l := newProjector(t, 0)

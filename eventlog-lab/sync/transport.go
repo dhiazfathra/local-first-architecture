@@ -17,6 +17,9 @@ type Stream interface {
 	Send(*syncpb.ClientFrame) error
 	Recv() (*syncpb.ServerFrame, error)
 	CloseSend() error
+	// Close releases transport resources (e.g. the dialed connection) on
+	// every exit path, not only the one that reaches CloseSend.
+	Close() error
 }
 
 // ServerStream is the server half of a session.

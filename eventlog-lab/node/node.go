@@ -61,6 +61,13 @@ func New(cfg Config) (*Node, error) {
 // up. Observing the stored maximum once, before the node is used, removes
 // that window.
 //
+// ponytail: only scans surviving event rows, not snapshots, so a node whose
+// entire history has been compacted away would recover no HLC at all. No
+// production caller invokes Log.Compact today (only internal/jepsenlite's
+// fault harness does), so this can't happen outside tests; if a production
+// compaction path is added, store a durable HLC watermark alongside
+// seq_watermark the same way Compact raises it before deleting rows.
+//
 // ponytail: full scan of the log, no new Log method or index -- Since already
 // orders by HLC and both backends implement it. If startup ever shows up in a
 // profile, add a `SELECT MAX(hlc_wall), ...` to the interface.
@@ -164,6 +171,7 @@ func (n *Node) emit(ctx context.Context, sku string, fill func(*eventlog.Event))
 // convergence silently, which is far worse than dropping a frame.
 func (n *Node) Merge(ctx context.Context, events []eventlog.Event) (int, error) {
 	accepted := 0
+	touched := make(map[string]struct{})
 	for _, e := range events {
 		if err := n.log.Append(ctx, e); err != nil {
 			if errors.Is(err, eventlog.ErrMalformedEvent) {
@@ -175,7 +183,14 @@ func (n *Node) Merge(ctx context.Context, events []eventlog.Event) (int, error) 
 		}
 		n.clk.Observe(e.HLC)
 		accepted++
-		if err := n.projector.MaybeSnapshot(ctx, e.SKU); err != nil {
+		touched[e.SKU] = struct{}{}
+	}
+	// Reconcile each distinct SKU once per batch rather than once per event:
+	// a replication batch often carries many events for the same SKU, and
+	// each Project/UpsertProjection reloads and re-folds that SKU's history.
+	sink, isSink := n.log.(projectionSink)
+	for sku := range touched {
+		if err := n.projector.MaybeSnapshot(ctx, sku); err != nil {
 			return accepted, fmt.Errorf("node %q merge: %w", n.id, err)
 		}
 		// The reporting projection (Postgres central only) must stay
@@ -184,15 +199,16 @@ func (n *Node) Merge(ctx context.Context, events []eventlog.Event) (int, error) 
 		// exactly the gap a merge-only central store must not have. n.log is
 		// an ordinary eventlog.Log everywhere except central, so this is an
 		// optional capability check, not a Postgres import here.
-		if sink, ok := n.log.(projectionSink); ok {
-			state, err := n.projector.Project(ctx, e.SKU)
-			if err != nil {
-				return accepted, fmt.Errorf("node %q merge: project %q: %w", n.id, e.SKU, err)
-			}
-			if err := sink.UpsertProjection(ctx, e.SKU, state.Quantity(),
-				state.Name.Value, state.ReorderPoint.Value, state.Deleted.Value); err != nil {
-				return accepted, fmt.Errorf("node %q merge: upsert projection %q: %w", n.id, e.SKU, err)
-			}
+		if !isSink {
+			continue
+		}
+		state, err := n.projector.Project(ctx, sku)
+		if err != nil {
+			return accepted, fmt.Errorf("node %q merge: project %q: %w", n.id, sku, err)
+		}
+		if err := sink.UpsertProjection(ctx, sku, state.Quantity(),
+			state.Name.Value, state.ReorderPoint.Value, state.Deleted.Value); err != nil {
+			return accepted, fmt.Errorf("node %q merge: upsert projection %q: %w", n.id, sku, err)
 		}
 	}
 	return accepted, nil

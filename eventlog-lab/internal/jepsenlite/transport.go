@@ -281,11 +281,10 @@ func (c *CrashLog) AppendLocal(ctx context.Context, mint func(eventlog.Seq) even
 		// process would.
 		closeErr := c.inner.Close()
 		l, err := eventlog.OpenSQLite(c.dsn)
-		c.mu.Unlock()
 		if err != nil {
+			c.mu.Unlock()
 			return eventlog.Event{}, fmt.Errorf("reopen after injected crash: %w", err)
 		}
-		c.mu.Lock()
 		c.inner = l
 		c.mu.Unlock()
 		if closeErr != nil {

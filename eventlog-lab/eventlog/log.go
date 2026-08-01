@@ -23,6 +23,9 @@ type Log interface {
 
 	// AppendLocal allocates the next local Seq and inserts the event mint
 	// produces in a single transaction, so a crash can never leave a gap.
+	// Implementations may call mint more than once (e.g. once to read the
+	// node id before the real Seq is known); mint must be side-effect free
+	// and return an equivalent event for the same Seq on every call.
 	AppendLocal(ctx context.Context, mint func(Seq) Event) (Event, error)
 
 	// Since streams every held event not covered by vv, in HLC order.

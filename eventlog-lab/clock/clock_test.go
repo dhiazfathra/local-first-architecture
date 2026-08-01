@@ -35,7 +35,7 @@ func TestHLCCompare(t *testing.T) {
 
 // fakeWall returns a WallFunc reading from a mutable slice of readings; the
 // last reading repeats once exhausted.
-func fakeWall(readings ...int64) (WallFunc, *int) {
+func fakeWall(readings ...int64) WallFunc {
 	i := 0
 	return func() int64 {
 		v := readings[i]
@@ -43,7 +43,7 @@ func fakeWall(readings ...int64) (WallFunc, *int) {
 			i++
 		}
 		return v
-	}, &i
+	}
 }
 
 func TestClockNowMonotonic(t *testing.T) {
@@ -86,7 +86,7 @@ func TestClockNowMonotonic(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			wall, _ := fakeWall(tt.readings...)
+			wall := fakeWall(tt.readings...)
 			c := New("A", wall)
 			var prev HLC
 			for i := 0; i < tt.calls; i++ {
@@ -140,7 +140,7 @@ func TestClockObserve(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			wall, _ := fakeWall(tt.wall)
+			wall := fakeWall(tt.wall)
 			c := New("A", wall)
 			got := c.Observe(tt.remote)
 			if got != tt.want {

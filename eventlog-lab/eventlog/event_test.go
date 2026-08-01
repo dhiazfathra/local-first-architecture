@@ -2,6 +2,7 @@ package eventlog
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
@@ -92,6 +93,7 @@ func TestEventValidate(t *testing.T) {
 		{"empty sku", base(func(e *Event) { e.SKU = "" }), true},
 		{"unknown kind", base(func(e *Event) { e.Kind = 99 }), true},
 		{"zero delta on quantity kind", base(func(e *Event) { e.Delta = 0 }), true},
+		{"unnegatable delta on quantity kind", base(func(e *Event) { e.Delta = math.MinInt64 }), true},
 		{"meta kind without meta", base(func(e *Event) { e.Kind = KindMetaSet; e.Delta = 0 }), true},
 		{"meta kind with empty meta", base(func(e *Event) { e.Kind = KindMetaSet; e.Delta = 0; e.Meta = &MetaSet{} }), true},
 		{"delete kind without value", base(func(e *Event) { e.Kind = KindDeleteSet; e.Delta = 0 }), true},

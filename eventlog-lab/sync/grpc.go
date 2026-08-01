@@ -44,17 +44,31 @@ func (s *grpcStream) CloseSend() error {
 	// Half-closing the send side does not mean the server has received or
 	// applied anything already in flight -- over a real connection those
 	// frames can still be buffered. By protocol the server ends the session
-	// right after our Ack, so one more Recv either confirms that (io.EOF) or
-	// surfaces why it didn't. Only after that is it safe to tear down the
-	// conn: closing it first can race the server's in-flight merge and
-	// silently drop it.
+	// right after our Ack, so draining Recv until it errors either confirms
+	// that (io.EOF) or surfaces why it didn't.
 	var drainErr error
-	if _, recvErr := s.Recv(); recvErr != nil && !errors.Is(recvErr, io.EOF) {
-		drainErr = recvErr
+	for {
+		_, recvErr := s.Recv()
+		if recvErr == nil {
+			continue
+		}
+		if !errors.Is(recvErr, io.EOF) {
+			drainErr = recvErr
+		}
+		break
 	}
-	closeErr := s.conn.Close()
-	if err := errors.Join(sendErr, drainErr, closeErr); err != nil {
+	if err := errors.Join(sendErr, drainErr); err != nil {
 		return fmt.Errorf("grpc close send: %w", err)
+	}
+	return nil
+}
+
+// Close releases the dialed connection. It must run on every exit path from
+// a session, not only the one that reaches CloseSend, or a failed session
+// leaks a *grpc.ClientConn.
+func (s *grpcStream) Close() error {
+	if err := s.conn.Close(); err != nil {
+		return fmt.Errorf("grpc close: %w", err)
 	}
 	return nil
 }

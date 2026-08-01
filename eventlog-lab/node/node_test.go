@@ -320,8 +320,8 @@ func TestMergeSnapshotFailure(t *testing.T) {
 }
 
 // sinkLog wraps a real log and implements projectionSink, exercising Merge's
-// optional central-reporting branch (added for Task 10's Postgres store; no
-// concrete type in this codebase implements it yet).
+// optional central-reporting branch. eventlog.PostgresLog is the production
+// implementation; this double keeps the branch testable over SQLite.
 type sinkLog struct {
 	crdt.SQLLog
 	failUpsert  bool

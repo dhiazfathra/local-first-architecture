@@ -313,6 +313,13 @@ func TestCursorRoundTrip(t *testing.T) {
 	if got, err = l.Cursor(ctx, "B"); err != nil || got != 9 {
 		t.Fatalf("Cursor() = %d, %v; want 9, nil", got, err)
 	}
+	// A peer reporting a regressed vector must not shrink our record.
+	if err := l.SetCursor(ctx, "B", 4); err != nil {
+		t.Fatalf("SetCursor() error = %v", err)
+	}
+	if got, err = l.Cursor(ctx, "B"); err != nil || got != 9 {
+		t.Fatalf("Cursor() = %d, %v after a regressed report; want 9, nil", got, err)
+	}
 }
 
 func TestClosedLogReturnsErrors(t *testing.T) {
@@ -485,6 +492,9 @@ func TestAppendLocalFailsWhenSeqAllocationQueryErrors(t *testing.T) {
 
 func TestAppendLocalFailsWhenInsertErrors(t *testing.T) {
 	ctx := context.Background()
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits, so a read-only database still accepts writes")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ro.db")
 	l, err := OpenSQLite(path)
@@ -505,5 +515,4 @@ func TestAppendLocalFailsWhenInsertErrors(t *testing.T) {
 }
 
 // SQLiteLog must satisfy Log.
-// uncommented in Task 6, once Compact exists
 var _ Log = (*SQLiteLog)(nil)

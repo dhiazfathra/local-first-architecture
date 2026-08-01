@@ -29,7 +29,7 @@ import (
 )
 
 const usage = `usage:
-  lab node  --id ID --db FILE --central ADDR [--listen ADDR] [--every DUR] [--once]
+  lab node  --id ID --db FILE --central ADDR [--listen ADDR] [--every DUR] [--once] [--timeout DUR]
   lab op    --id ID --db FILE (receive|pick) SKU QTY
   lab state --id ID --db FILE SKU
   lab sim   [--seed N] [--nodes N] [--ops N] [--faults LIST]
@@ -197,13 +197,12 @@ func runNode(args []string, stdout, stderr io.Writer) error {
 
 	client := syncpkg.NewClient(n, syncpkg.NewGRPCDialer(
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(), //nolint:staticcheck // deliberate: --once must fail fast against a dead central, not hang.
 	), 64)
 
 	if *once {
-		// context.Background() here would let a dead central hang this
-		// process forever: grpc.WithBlock() makes dialing wait for
-		// connectivity, so the context deadline is what actually bounds it.
+		// grpc.NewClient dials lazily and ignores WithBlock, so the context
+		// deadline below is what actually bounds a dead central instead of
+		// hanging this process forever.
 		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 		defer cancel()
 		rep, err := client.SyncOnce(ctx, *central)
@@ -237,9 +236,24 @@ func runNode(args []string, stdout, stderr io.Writer) error {
 		// Wait for the goroutine to finish before returning: otherwise it
 		// can still be writing to stderr after this function -- and the
 		// caller reading its output -- have moved on.
-		defer func() { gs.Stop(); <-serveDone }()
+		defer func() { gs.GracefulStop(); <-serveDone }()
 		_, _ = fmt.Fprintf(stdout, "node %s serving on %s\n", n.ID(), *listen)
 	}
+
+	syncOnce := func() {
+		// Sync failures are expected offline; a node stays usable.
+		rep, err := client.SyncWithBackoff(ctx, *central, 4, 200*time.Millisecond, nil)
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, "sync:", err)
+			return
+		}
+		_, _ = fmt.Fprintf(stdout, "synced with %s: sent %d received %d\n",
+			rep.PeerID, rep.Sent, rep.Received)
+	}
+
+	// Sync immediately so a freshly started node does not sit unsynchronized
+	// for up to a full --every interval before its first attempt.
+	syncOnce()
 
 	ticker := time.NewTicker(*every)
 	defer ticker.Stop()
@@ -248,14 +262,7 @@ func runNode(args []string, stdout, stderr io.Writer) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			// Sync failures are expected offline; a node stays usable.
-			rep, err := client.SyncWithBackoff(ctx, *central, 4, 200*time.Millisecond, nil)
-			if err != nil {
-				_, _ = fmt.Fprintln(stderr, "sync:", err)
-				continue
-			}
-			_, _ = fmt.Fprintf(stdout, "synced with %s: sent %d received %d\n",
-				rep.PeerID, rep.Sent, rep.Received)
+			syncOnce()
 		}
 	}
 }

@@ -73,7 +73,7 @@ func TestCheckConvergenceDetectsDivergenceAndNamesTheSKU(t *testing.T) {
 	if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 5}); err != nil {
 		t.Fatalf("ApplyOp() error = %v", err)
 	}
-	if err := c.Quiesce(ctx, 8); err != nil {
+	if _, err := c.Quiesce(ctx, 8); err != nil {
 		t.Fatalf("Quiesce() error = %v", err)
 	}
 	// Now diverge N0 only.
@@ -113,7 +113,7 @@ func TestCheckNoLostEventDetectsAMissingEvent(t *testing.T) {
 	if err := c.CheckNoLostEvent(ctx, []eventlog.EventID{id}); err == nil {
 		t.Fatalf("CheckNoLostEvent() before sync = nil, want error")
 	}
-	if err := c.Quiesce(ctx, 8); err != nil {
+	if _, err := c.Quiesce(ctx, 8); err != nil {
 		t.Fatalf("Quiesce() error = %v", err)
 	}
 	if err := c.CheckNoLostEvent(ctx, []eventlog.EventID{id}); err != nil {
@@ -135,7 +135,7 @@ func TestCheckOrderIndependenceOnAContendedSKU(t *testing.T) {
 			t.Fatalf("ApplyOp(%+v) error = %v", op, err)
 		}
 	}
-	if err := cl.Quiesce(ctx, 16); err != nil {
+	if _, err := cl.Quiesce(ctx, 16); err != nil {
 		t.Fatalf("Quiesce() error = %v", err)
 	}
 	if err := cl.CheckOrderIndependence(ctx, rand.New(rand.NewSource(21)), sch.SKUs); err != nil {
@@ -155,7 +155,7 @@ func TestQuiesceReportsFailureRatherThanGivingUpSilently(t *testing.T) {
 	if _, err := c.ApplyOp(ctx, Op{Node: "N0", Kind: OpReceive, SKU: "SKU-0", Qty: 1}); err != nil {
 		t.Fatalf("ApplyOp() error = %v", err)
 	}
-	if err := c.Quiesce(ctx, 0); err == nil {
+	if _, err := c.Quiesce(ctx, 0); err == nil {
 		t.Fatalf("Quiesce(maxRounds=0) = nil, want error")
 	}
 }
@@ -264,7 +264,7 @@ func TestCompactionSkipsEventsAStalePeerHasNotAcked(t *testing.T) {
 
 	// Now the stale peer syncs and everyone must still converge, from the
 	// raw (undeleted) events -- this test never exercised deletion safety.
-	if err := c.Quiesce(ctx, 16); err != nil {
+	if _, err := c.Quiesce(ctx, 16); err != nil {
 		t.Fatalf("Quiesce() error = %v", err)
 	}
 	if err := c.CheckConvergence(ctx, []string{"SKU-0"}); err != nil {
@@ -331,7 +331,7 @@ func TestCompactionDeletesEventsOnceAllPeersHaveAcked(t *testing.T) {
 		t.Fatalf("CountForSKU() after Compact = %d, want 0 -- fully-acked, snapshotted events must be deleted", after)
 	}
 
-	if err := c.Quiesce(ctx, 16); err != nil {
+	if _, err := c.Quiesce(ctx, 16); err != nil {
 		t.Fatalf("Quiesce() error = %v", err)
 	}
 	if err := c.CheckConvergence(ctx, []string{"SKU-0"}); err != nil {

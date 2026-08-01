@@ -22,17 +22,13 @@ func newNode(t *testing.T, id clock.NodeID) *node.Node {
 	}
 	t.Cleanup(func() { _ = l.Close() })
 	wall := int64(1000)
-	n, err := New2(t, id, l, func() int64 { wall += 10; return wall })
+	n, err := node.New(node.Config{
+		ID: id, Log: l, Wall: func() int64 { wall += 10; return wall }, SnapshotEvery: 4,
+	})
 	if err != nil {
 		t.Fatalf("node.New() error = %v", err)
 	}
 	return n
-}
-
-// New2 keeps the node construction in one place for these tests.
-func New2(t *testing.T, id clock.NodeID, l *eventlog.SQLiteLog, wall clock.WallFunc) (*node.Node, error) {
-	t.Helper()
-	return node.New(node.Config{ID: id, Log: l, Wall: wall, SnapshotEvery: 4})
 }
 
 func syncPair(t *testing.T, client, server *node.Node, batch int) Report {
@@ -258,11 +254,6 @@ func TestClientSurfacesTransportErrors(t *testing.T) {
 		{"welcome missing", failingDialer{frames: []*syncpb.ServerFrame{
 			{Body: &syncpb.ServerFrame_Ack{Ack: &syncpb.Ack{}}},
 		}}},
-		{"server sends malformed event", failingDialer{frames: []*syncpb.ServerFrame{
-			{Body: &syncpb.ServerFrame_Welcome{Welcome: &syncpb.Welcome{NodeId: "B"}}},
-			{Body: &syncpb.ServerFrame_Events{Events: &syncpb.Events{Events: []*syncpb.Event{{NodeId: "B", Seq: 1, Sku: "S", Kind: 99}}}}},
-			{Body: &syncpb.ServerFrame_Ack{Ack: &syncpb.Ack{}}},
-		}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -270,6 +261,30 @@ func TestClientSurfacesTransportErrors(t *testing.T) {
 				t.Fatal("SyncOnce() error = nil, want an error")
 			}
 		})
+	}
+}
+
+// TestClientToleratesPeerSendingAMalformedEvent proves one bad event from a
+// peer does not fail the whole session: same policy as the server, the event
+// is rejected and counted, and the session keeps running so this pair can
+// still converge.
+func TestClientToleratesPeerSendingAMalformedEvent(t *testing.T) {
+	ctx := context.Background()
+	a := newNode(t, "A")
+	dialer := failingDialer{frames: []*syncpb.ServerFrame{
+		{Body: &syncpb.ServerFrame_Welcome{Welcome: &syncpb.Welcome{NodeId: "B"}}},
+		{Body: &syncpb.ServerFrame_Events{Events: &syncpb.Events{Events: []*syncpb.Event{{NodeId: "B", Seq: 1, Sku: "S", Kind: 99}}}}},
+		{Body: &syncpb.ServerFrame_Ack{Ack: &syncpb.Ack{}}},
+	}}
+	rep, err := NewClient(a, dialer, 8).SyncOnce(ctx, "peer")
+	if err != nil {
+		t.Fatalf("SyncOnce() error = %v, want the session to continue past the bad event", err)
+	}
+	if rep.Rejected != 1 {
+		t.Errorf("Rejected = %d, want 1", rep.Rejected)
+	}
+	if rep.Received != 0 {
+		t.Errorf("Received = %d, want 0", rep.Received)
 	}
 }
 
@@ -370,6 +385,7 @@ type failingStream struct {
 
 func (s *failingStream) Send(*syncpb.ClientFrame) error { return s.d.sendErr }
 func (s *failingStream) CloseSend() error               { return nil }
+func (s *failingStream) Close() error                   { return nil }
 func (s *failingStream) Recv() (*syncpb.ServerFrame, error) {
 	if s.d.recvErr != nil {
 		return nil, s.d.recvErr

@@ -20,15 +20,7 @@ func TestNowIsMonotonicUnderBackwardsWallJumps(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			i := 0
-			wall := func() int64 {
-				v := tt.readings[i]
-				if i < len(tt.readings)-1 {
-					i++
-				}
-				return v
-			}
-			c := New("A", wall)
+			c := New("A", fakeWall(tt.readings...))
 
 			prev := c.Now()
 			for step := 1; step < len(tt.readings)+3; step++ {
@@ -68,15 +60,7 @@ func TestObserveKeepsCausalityAcrossABackwardsJumpingClock(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			readings := []int64{100, 99, 98, 97}
-			i := 0
-			c := New("A", func() int64 {
-				v := readings[i]
-				if i < len(readings)-1 {
-					i++
-				}
-				return v
-			})
+			c := New("A", fakeWall(100, 99, 98, 97))
 			_ = c.Now()
 
 			observed := c.Observe(tt.remote)

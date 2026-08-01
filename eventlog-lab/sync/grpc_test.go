@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -56,18 +57,34 @@ func TestGRPCDialerRejectsBadTarget(t *testing.T) {
 }
 
 // TestGRPCDialerReplicateFails exercises the branch where grpc.NewClient
-// succeeds (it dials lazily) but opening the Replicate stream itself fails --
-// here because the target resolves to zero addresses.
+// succeeds (it dials lazily, so a malformed target would fail there instead)
+// but opening the Replicate stream itself fails. A parseable target with
+// nothing listening gets grpc.NewClient past construction and fails the
+// stream open with a connection error.
 func TestGRPCDialerReplicateFails(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	addr := lis.Addr().String()
+	if err := lis.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
 	dialer := NewGRPCDialer(grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if _, err := dialer.Dial(context.Background(), "!!!not a target!!!"); err == nil {
+	_, err = dialer.Dial(context.Background(), addr)
+	if err == nil {
 		t.Fatal("Dial() error = nil, want the Replicate() failure to surface")
+	}
+	if !strings.Contains(err.Error(), "grpc replicate") {
+		t.Fatalf("Dial() error = %q, want it to contain %q", err, "grpc replicate")
 	}
 }
 
 // TestGRPCStreamCloseSendSurfacesConnCloseError closes the underlying
-// connection out from under the stream, so CloseSend's own conn.Close() call
-// hits an already-closing connection and returns an error.
+// connection out from under the stream, so CloseSend's drain Recv hits an
+// already-closed connection and its error surfaces rather than being
+// swallowed.
 func TestGRPCStreamCloseSendSurfacesConnCloseError(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

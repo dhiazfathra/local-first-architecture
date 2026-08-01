@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/dhiazfathra/local-first-architecture/eventlog-lab/clock"
 )
@@ -120,6 +121,12 @@ func (e Event) Validate() error {
 	case KindQuantityDelta:
 		if e.Delta == 0 {
 			return fmt.Errorf("%w: zero quantity delta", ErrMalformedEvent)
+		}
+		if e.Delta == math.MinInt64 {
+			// crdt.ItemState.Apply computes -e.Delta; negating MinInt64
+			// overflows back to itself in two's complement, silently
+			// corrupting the PN-counter.
+			return fmt.Errorf("%w: delta %d cannot be negated", ErrMalformedEvent, e.Delta)
 		}
 	case KindMetaSet:
 		if e.Meta.Empty() {

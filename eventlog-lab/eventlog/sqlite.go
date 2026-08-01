@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math"
 
 	_ "modernc.org/sqlite" // pure-Go driver, no cgo
 
@@ -173,6 +174,10 @@ func scanEvent(s scanner) (Event, error) {
 		return Event{}, fmt.Errorf("scan event row: %w", err)
 	}
 	e.ID = EventID{NodeID: clock.NodeID(node), Seq: Seq(seq)}
+	if logical < 0 || logical > math.MaxUint32 {
+		return Event{}, fmt.Errorf("%w: hlc logical %d out of range for %v",
+			ErrMalformedEvent, logical, e.ID)
+	}
 	e.HLC.Logical = uint32(logical)
 	e.HLC.NodeID = e.ID.NodeID
 	e.Kind = Kind(kind)
@@ -185,7 +190,8 @@ func scanEvent(s scanner) (Event, error) {
 	return e, nil
 }
 
-// VersionVector reports the highest Seq held per node.
+// VersionVector reports each node's highest gap-free Seq prefix, floored by
+// seq_watermark. See Log.VersionVector: this is not a raw MAX(seq).
 func (l *SQLiteLog) VersionVector(ctx context.Context) (VersionVector, error) {
 	rows, err := l.db.QueryContext(ctx, versionVectorQuery)
 	if err != nil {

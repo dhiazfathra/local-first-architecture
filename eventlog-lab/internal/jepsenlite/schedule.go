@@ -46,8 +46,8 @@ type Op struct {
 }
 
 // FaultEvent schedules a fault to fire immediately before op index At.
-// Kind is "partition", "asym", "heal", or "crash"; A and B name the nodes
-// involved ("crash" and "heal" use A only, "heal" uses neither).
+// Kind is "partition", "asym", "heal", or "crash". "partition" and "asym" use
+// both A and B, "crash" uses A only, and "heal" uses neither.
 type FaultEvent struct {
 	At   int
 	Kind string
@@ -89,8 +89,9 @@ func GenSchedule(seed int64, nodes, ops int, f Faults) Schedule {
 	for i := 0; i < nodes; i++ {
 		s.Nodes = append(s.Nodes, clock.NodeID(fmt.Sprintf("N%d", i)))
 	}
-	// Few SKUs on purpose: contention finds bugs, breadth does not.
-	for i := 0; i <= max(1, nodes); i++ {
+	// Few SKUs on purpose: contention finds bugs, breadth does not. nodes is
+	// already clamped to at least 1 above, so this creates nodes + 1 SKUs.
+	for i := 0; i <= nodes; i++ {
 		s.SKUs = append(s.SKUs, fmt.Sprintf("SKU-%d", i))
 	}
 

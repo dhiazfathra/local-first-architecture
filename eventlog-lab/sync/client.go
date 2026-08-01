@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 type Report struct {
 	Sent     int
 	Received int
+	Rejected int
 	PeerID   clock.NodeID
 	PeerVV   eventlog.VersionVector
 }
@@ -46,6 +48,7 @@ func (c *Client) SyncOnce(ctx context.Context, addr string) (Report, error) {
 	if err != nil {
 		return Report{}, fmt.Errorf("sync client: dial %q: %w", addr, err)
 	}
+	defer func() { _ = st.Close() }()
 	if err := st.Send(&syncpb.ClientFrame{Body: &syncpb.ClientFrame_Hello{
 		Hello: &syncpb.Hello{NodeId: string(c.replica.ID()), VersionVector: encodeVV(mine)},
 	}}); err != nil {
@@ -108,8 +111,13 @@ func (c *Client) consume(ctx context.Context, st Stream) (Report, error) {
 			if err != nil {
 				return Report{}, fmt.Errorf("sync client: %w", err)
 			}
-			if n != len(body.Events.GetEvents()) {
-				return Report{}, fmt.Errorf("sync client: peer %q sent an unapplicable event", rep.PeerID)
+			if rejected := len(body.Events.GetEvents()) - n; rejected > 0 {
+				// Same policy as the server: reject the bad event, log
+				// loudly, continue the session. Failing here would let one
+				// poisoned event block this pair from ever converging again.
+				slog.Warn("peer sent unapplicable events; skipping them",
+					"replica", c.replica.ID(), "peer", rep.PeerID, "rejected", rejected)
+				rep.Rejected += rejected
 			}
 			rep.Received += n
 		case *syncpb.ServerFrame_Ack:
@@ -129,7 +137,12 @@ func (c *Client) SyncWithBackoff(ctx context.Context, addr string, attempts int,
 	if sleep == nil {
 		sleep = func(d time.Duration) time.Duration {
 			jittered := time.Duration(rand.Int64N(int64(d) + 1))
-			time.Sleep(jittered)
+			t := time.NewTimer(jittered)
+			defer t.Stop()
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+			}
 			return jittered
 		}
 	}
@@ -144,8 +157,28 @@ func (c *Client) SyncWithBackoff(ctx context.Context, addr string, attempts int,
 		}
 		lastErr = err
 		if attempt < attempts-1 {
-			sleep(base << attempt)
+			sleep(backoffFor(base, attempt))
 		}
 	}
 	return Report{}, fmt.Errorf("sync client: gave up after %d attempts: %w", attempts, lastErr)
+}
+
+// maxBackoff bounds one backoff delay, so a large attempts count cannot
+// overflow the shift at the call site or stall a session for hours.
+const maxBackoff = 30 * time.Second
+
+// backoffFor returns base doubled attempt times, clamped to maxBackoff and
+// never negative.
+func backoffFor(base time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	d := base
+	for i := 0; i < attempt; i++ {
+		if d >= maxBackoff/2 {
+			return maxBackoff
+		}
+		d *= 2
+	}
+	return min(d, maxBackoff)
 }
