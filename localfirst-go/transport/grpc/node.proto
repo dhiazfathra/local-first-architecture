@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package localfirst.node.v1;
+
+option go_package = "github.com/dhiazfathra/local-first-architecture/localfirst-go/transport/grpc/nodepb";
+
+// Node is the client-facing API of one node. Every call is served entirely from
+// local state: no network hop to central, ever.
+service Node {
+  rpc Receive(ReceiveRequest) returns (Empty);
+  rpc Issue(IssueRequest) returns (Empty);
+  rpc Move(MoveRequest) returns (Empty);
+  rpc Balance(BalanceRequest) returns (BalanceResponse);
+  rpc Balances(Empty) returns (BalancesResponse);
+}
+
+message Empty {}
+
+message ReceiveRequest { string sku = 1; string location = 2; int64 qty = 3; }
+message IssueRequest   { string sku = 1; string location = 2; int64 qty = 3; }
+message MoveRequest    { string sku = 1; string from = 2; string to = 3; int64 qty = 4; }
+
+message BalanceRequest  { string sku = 1; string location = 2; }
+message BalanceResponse { int64 qty = 1; }
+
+message BalanceEntry { string sku = 1; string location = 2; int64 qty = 3; }
+message BalancesResponse { repeated BalanceEntry entries = 1; }
