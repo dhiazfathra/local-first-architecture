@@ -264,13 +264,22 @@ func TestCompensationDrivesALocationNegative(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Exceptions: %v", err)
 	}
-	for _, row := range exceptions {
-		if row.Kind == projection.ExceptionNegativeBalance && !row.Resolved {
-			t.Errorf("negative row = %+v, want it resolved after the stock count", row)
+	var refreshedCompensation *projection.ExceptionRow
+	for i := range exceptions {
+		switch exceptions[i].Kind {
+		case projection.ExceptionNegativeBalance:
+			if !exceptions[i].Resolved {
+				t.Errorf("negative row = %+v, want it resolved after the stock count", exceptions[i])
+			}
+		case projection.ExceptionCompensation:
+			refreshedCompensation = &exceptions[i]
 		}
 	}
+	if refreshedCompensation == nil {
+		t.Fatalf("exceptions = %+v, want the compensation row still present", exceptions)
+	}
 	// The compensation itself is never resolved away: it is a permanent audit record.
-	if compensation.Resolved {
+	if refreshedCompensation.Resolved {
 		t.Error("the compensation row was resolved; it is history, not a task")
 	}
 	assertDeterministic(t, w)

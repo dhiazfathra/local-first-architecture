@@ -541,20 +541,23 @@ func TestApplyStockAppliesTransferDispatchedAtTheOriginatingNode(t *testing.T) {
 	}
 }
 
-// TestApplyStockAppliesTransferReceivedWithNoTransfersTableYet proves the
-// pre-Task-16 fallback: with no transfers table at all, a TransferReceived is
-// always applied rather than silently dropped.
-func TestApplyStockAppliesTransferReceivedWithNoTransfersTableYet(t *testing.T) {
-	l, set := openSet(t)
-	mv := domain.Movement{SKU: "WIDGET", LotID: "L1", From: domain.External, To: "RECV-01", Qty: 5}
-	emit(t, l, set, domain.Event{Type: domain.TypeTransferReceived, AggregateID: "T1",
-		Payload: domain.TransferReceived{TransferID: "T1", Lines: []domain.Movement{mv}}})
-	got, err := set.Balance(domain.StockKey{SKU: "WIDGET", Location: "RECV-01", LotID: "L1"})
-	if err != nil {
-		t.Fatalf("Balance: %v", err)
+// TestApplyStockErrorsWithNoTransfersTable proves that once the transfers table is
+// genuinely missing, transferToNode's query failure surfaces as an error out of
+// applyStock rather than being folded into "always apply".
+func TestApplyStockErrorsWithNoTransfersTable(t *testing.T) {
+	_, set := openSet(t)
+	if _, err := set.db.Exec(`DROP TABLE transfers`); err != nil {
+		t.Fatalf("drop transfers table: %v", err)
 	}
-	if got != 5 {
-		t.Fatalf("balance = %v, want 5: a TransferReceived must apply when there is no transfers table to consult", got)
+	mv := domain.Movement{SKU: "WIDGET", LotID: "L1", From: domain.External, To: "RECV-01", Qty: 5}
+	tx, err := set.db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	err = applyStock(tx, "", domain.TransferReceived{TransferID: "T1", Lines: []domain.Movement{mv}})
+	if err == nil {
+		t.Fatal("applyStock: expected an error with no transfers table, got nil")
 	}
 }
 

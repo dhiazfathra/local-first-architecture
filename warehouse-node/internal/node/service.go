@@ -77,7 +77,11 @@ func (s *Service) rebuildState() error {
 }
 
 // Close releases the underlying database.
-func (s *Service) Close() error { return s.log.Close() }
+func (s *Service) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.log.Close()
+}
 
 // NodeID is this node's identity.
 func (s *Service) NodeID() domain.NodeID { return s.log.NodeID() }
@@ -184,15 +188,29 @@ func (s *Service) apply(envs []domain.Envelope) error {
 
 // StockOnHand returns operator-visible balances. Empty arguments mean "no filter".
 func (s *Service) StockOnHand(sku string, location domain.LocationCode) ([]projection.StockRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.set.StockOnHand(sku, location)
 }
 
 // Reservations returns every reservation this node knows about.
-func (s *Service) Reservations() ([]projection.ReservationRow, error) { return s.set.Reservations() }
+func (s *Service) Reservations() ([]projection.ReservationRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.set.Reservations()
+}
 
 // Exceptions returns what central reversed and why, plus any balance a compensation
 // drove negative.
-func (s *Service) Exceptions() ([]projection.ExceptionRow, error) { return s.set.Exceptions() }
+func (s *Service) Exceptions() ([]projection.ExceptionRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.set.Exceptions()
+}
 
 // Transfers returns this node's view of every inter-node transfer.
-func (s *Service) Transfers() ([]projection.TransferRow, error) { return s.set.Transfers() }
+func (s *Service) Transfers() ([]projection.TransferRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.set.Transfers()
+}

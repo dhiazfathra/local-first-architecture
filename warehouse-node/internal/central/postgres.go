@@ -412,16 +412,16 @@ func (p *Postgres) PurchaseOrder(ctx context.Context, poRef, sku string) (float6
 // would otherwise let a dispatch of an item the node should refuse through
 // with no way to undo it.
 func (p *Postgres) RegisterNode(ctx context.Context, node domain.NodeID, rejects []string) error {
-	if _, err := p.pool.Exec(ctx,
-		`INSERT INTO nodes (node_id) VALUES ($1) ON CONFLICT (node_id) DO NOTHING`, string(node)); err != nil {
-		return fmt.Errorf("register node %s: %w", node, err)
-	}
-
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin register node %s: %w", node, err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO nodes (node_id) VALUES ($1) ON CONFLICT (node_id) DO NOTHING`, string(node)); err != nil {
+		return fmt.Errorf("register node %s: %w", node, err)
+	}
 
 	if _, err := tx.Exec(ctx, `DELETE FROM node_rejects WHERE node_id = $1`, string(node)); err != nil {
 		return fmt.Errorf("clear rejects for %s: %w", node, err)

@@ -334,8 +334,12 @@ func TestRealMainRejectsBadListenAddress(t *testing.T) {
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
 	os.Args = []string{"central", "--listen", "not-an-address"}
-	if err := realMain(); err == nil {
+	err := realMain()
+	if err == nil {
 		t.Fatal("realMain: expected an error from an unlistenable address")
+	}
+	if !strings.Contains(err.Error(), "listen on") {
+		t.Fatalf("realMain error = %q, want it to reach the listen failure path", err)
 	}
 }
 

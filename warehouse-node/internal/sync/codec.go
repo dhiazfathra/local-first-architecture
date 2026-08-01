@@ -64,6 +64,10 @@ func DecodeEnvelope(e *syncpb.Event) (domain.Envelope, error) {
 		Payload:    json.RawMessage(e.GetPayload()),
 	}
 	if c := e.GetCausationId(); c != nil {
+		if c.GetNodeId() == "" || c.GetSeq() == 0 {
+			return domain.Envelope{}, fmt.Errorf("decode event %s/%d: causation identity is incomplete",
+				e.GetId().GetNodeId(), e.GetId().GetSeq())
+		}
 		env.CausationID = &domain.EventID{NodeID: domain.NodeID(c.GetNodeId()), Seq: c.GetSeq()}
 	}
 	return env, nil

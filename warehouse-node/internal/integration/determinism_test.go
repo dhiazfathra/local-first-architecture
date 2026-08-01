@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/domain"
@@ -169,38 +170,62 @@ func TestEveryScenarioReplaysIdentically(t *testing.T) {
 }
 
 // assertCentralBalancesSumToZero folds central's whole log through the same movement
-// arithmetic the nodes use. Because every movement carries an explicit from and to,
-// with external as the sentinel for the outside world, the sum of every balance must
-// be exactly zero. A non-zero sum means stock was invented or destroyed somewhere.
+// arithmetic the nodes use, then checks the result against both warehouses' own
+// StockOnHand projections at every non-external key. Summing every balance including
+// the external sentinel is always zero by construction regardless of what actually
+// happened, so that check alone proves nothing; comparing central's replayed view to
+// the nodes' live one catches a real divergence between them.
 func assertCentralBalancesSumToZero(t *testing.T, c *cluster) {
 	t.Helper()
 	envs, err := c.store.Events(context.Background())
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}
-	balances := map[domain.StockKey]float64{}
+	central := map[domain.StockKey]float64{}
 	for _, env := range envs {
 		payload, err := domain.DecodePayload(env)
 		if err != nil {
 			t.Fatalf("DecodePayload(%s): %v", env.ID, err)
 		}
 		for _, m := range movementsOfEnvelope(payload) {
-			balances[m.FromKey()] -= m.Qty
-			balances[m.ToKey()] += m.Qty
+			central[m.FromKey()] -= m.Qty
+			central[m.ToKey()] += m.Qty
 		}
 	}
-	var total float64
-	for _, qty := range balances {
-		total += qty
+	for k := range central {
+		if k.Location == domain.External {
+			delete(central, k)
+		}
 	}
-	if total != 0 {
-		t.Errorf("central balances sum to %v, want 0: every movement is a balanced pair", total)
+
+	nodes := map[domain.StockKey]float64{}
+	for _, id := range []domain.NodeID{"wh-a", "wh-b"} {
+		rows, err := c.node(id).svc.StockOnHand("", "")
+		if err != nil {
+			t.Fatalf("StockOnHand(%s): %v", id, err)
+		}
+		for _, r := range rows {
+			nodes[domain.StockKey{SKU: r.SKU, Location: r.Location, LotID: r.LotID}] += r.Qty
+		}
+	}
+
+	for k, want := range central {
+		if got := nodes[k]; got != want {
+			t.Errorf("key %+v: central balance %v, node balances sum to %v", k, want, got)
+		}
+	}
+	for k, got := range nodes {
+		if _, ok := central[k]; !ok && got != 0 {
+			t.Errorf("key %+v: node balance %v has no matching central balance", k, got)
+		}
 	}
 }
 
 // movementsOfEnvelope mirrors projection.MovementsOf for the payload types central
 // sees. It is duplicated here rather than exported because the projection package's
-// version is an internal detail of the read models.
+// version is an internal detail of the read models. An unrecognized payload fails the
+// test immediately rather than silently contributing no movement, so a newly added
+// movement-bearing event type cannot slip through this invariant unnoticed.
 func movementsOfEnvelope(payload any) []domain.Movement {
 	switch p := payload.(type) {
 	case domain.GoodsReceived:
@@ -215,7 +240,11 @@ func movementsOfEnvelope(payload any) []domain.Movement {
 		return p.Lines
 	case domain.TransferReceived:
 		return p.Lines
-	default:
+	case domain.ItemUpserted, domain.ReceiptOpened, domain.ReceiptLineRecorded, domain.ReceiptClosed,
+		domain.StockReserved, domain.ReservationReleased, domain.ReservationConsumed, domain.CountStarted,
+		domain.CountLineCounted, domain.CountClosed, domain.LocationRegistered:
 		return nil
+	default:
+		panic(fmt.Sprintf("movementsOfEnvelope: unrecognized payload type %T", payload))
 	}
 }

@@ -33,6 +33,9 @@ func DoReceive(s *State, c ReceiveCmd) ([]Event, error) {
 	note, po, lineNo := c.DeliveryNote, c.PORef, 1
 	switch {
 	case !open:
+		if c.DeliveryNote == "" || c.PORef == "" {
+			return nil, Violation(RuleAggregateState, "receipt %s requires a delivery note and PO reference", c.ReceiptID)
+		}
 		events = append(events, Event{Type: TypeReceiptOpened, AggregateID: c.ReceiptID,
 			Payload: ReceiptOpened{ReceiptID: c.ReceiptID, DeliveryNote: note, PORef: po}})
 	case receipt.Status != ReceiptOpen:

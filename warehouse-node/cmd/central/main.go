@@ -11,6 +11,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"reflect"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -68,10 +71,15 @@ func realMain() error {
 		return err
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	b, err := loadBootstrap(*bootstrap)
 	if err != nil {
 		return err
+	}
+	lis, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
 	store, err := central.OpenPostgres(ctx, *dsn)
 	if err != nil {
@@ -79,10 +87,6 @@ func realMain() error {
 	}
 	defer func() { _ = store.Close() }()
 
-	lis, err := net.Listen("tcp", *listen)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", *listen, err)
-	}
 	return run(ctx, store, b, *window, *every, time.Now, lis)
 }
 
@@ -118,6 +122,13 @@ func applyBootstrap(ctx context.Context, s central.Store, b Bootstrap, now time.
 		}
 	}
 	for _, item := range b.Items {
+		existing, found, err := s.Item(ctx, item.SKU)
+		if err != nil {
+			return err
+		}
+		if found && reflect.DeepEqual(existing, item) {
+			continue
+		}
 		if err := s.UpsertItem(ctx, item); err != nil {
 			return err
 		}

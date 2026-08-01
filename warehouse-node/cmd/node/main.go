@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -63,6 +65,9 @@ func realMain() error {
 		return err
 	}
 
+	if id == "" {
+		return fmt.Errorf("-id is required")
+	}
 	cfg.ID = domain.NodeID(id)
 	parsed, err := parseLocations(locations)
 	if err != nil {
@@ -74,7 +79,9 @@ func realMain() error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
-	return run(context.Background(), cfg, lis)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return run(ctx, cfg, lis)
 }
 
 // parseLocations turns the -locations flag into the map run expects.

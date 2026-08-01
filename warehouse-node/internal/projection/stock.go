@@ -36,11 +36,6 @@ func applyStock(tx *sql.Tx, home domain.NodeID, payload any) error {
 			return nil
 		}
 	case domain.TransferReceived:
-		// transferToNode never actually returns a non-nil error (it folds every
-		// failure, including a missing transfers table, into "" so this falls back
-		// to applying the move); this check exists so a future change tightening
-		// that fallback doesn't silently start swallowing a real error here too.
-		// Not covered: exercising it would require transferToNode to return one.
 		toNode, err := transferToNode(tx, p.TransferID)
 		if err != nil {
 			return err
@@ -63,9 +58,9 @@ func applyStock(tx *sql.Tx, home domain.NodeID, payload any) error {
 // transferToNode looks up the destination node of a transfer from the transfers
 // projection (populated by applyTransfer from the TransferDispatched half), so
 // applyStock can tell whether a TransferReceived it is folding in happened at this
-// node or is a metadata-only relay from central. An unknown transfer (not yet seen,
-// or the transfers table does not exist yet in code predating that projection)
-// returns "" and applyStock treats it as "apply", matching prior behavior.
+// node or is a metadata-only relay from central. An unknown transfer (not yet seen)
+// returns "" and applyStock treats it as "apply", matching prior behavior. Any other
+// query failure, including a missing transfers table, is returned as an error.
 func transferToNode(tx *sql.Tx, id string) (domain.NodeID, error) {
 	var to string
 	err := tx.QueryRow(`SELECT to_node FROM transfers WHERE id = ?`, id).Scan(&to)
@@ -73,7 +68,7 @@ func transferToNode(tx *sql.Tx, id string) (domain.NodeID, error) {
 	case err == sql.ErrNoRows:
 		return "", nil
 	case err != nil:
-		return "", nil // no transfers table yet (pre-Task-16 code): fall back to always applying
+		return "", fmt.Errorf("look up transfer %s destination: %w", id, err)
 	}
 	return domain.NodeID(to), nil
 }
@@ -84,7 +79,7 @@ func addStock(tx *sql.Tx, k domain.StockKey, delta float64) error {
 		k.SKU, string(k.Location), k.LotID, delta); err != nil {
 		return fmt.Errorf("adjust stock at %+v: %w", k, err)
 	}
-	if _, err := tx.Exec(`DELETE FROM stock_on_hand WHERE sku = ? AND location = ? AND lot_id = ? AND qty = 0`,
+	if _, err := tx.Exec(`DELETE FROM stock_on_hand WHERE sku = ? AND location = ? AND lot_id = ? AND abs(qty) < 1e-9`,
 		k.SKU, string(k.Location), k.LotID); err != nil {
 		return fmt.Errorf("prune zero stock at %+v: %w", k, err)
 	}
