@@ -1,0 +1,105 @@
+# Postgres, one central, three nodes. Container names are fixed because the demo
+# addresses them by name when it partitions the network, and the network is
+# named so that `docker network disconnect localfirst-go_lfnet lf-node-3` is
+# predictable.
+name: localfirst-go
+
+networks:
+  lfnet:
+  # hostnet keeps a node's published port reachable even after it is
+  # disconnected from lfnet: Docker routes a published port to whichever
+  # network a container still has, so the demo's gRPC calls to node-3 survive
+  # the partition while its path to central and its peers does not.
+  hostnet:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lf-postgres
+    networks: [lfnet]
+    environment:
+      POSTGRES_USER: localfirst
+      POSTGRES_PASSWORD: localfirst
+      POSTGRES_DB: localfirst
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U localfirst"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  central:
+    build: .
+    container_name: lf-central
+    networks: [lfnet]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - /central
+      - -dsn=postgres://localfirst:localfirst@postgres:5432/localfirst?sslmode=disable
+      - -listen=:9090
+      - -id=central
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  node-1:
+    build: .
+    container_name: lf-node-1
+    networks: [lfnet, hostnet]
+    depends_on: [central]
+    command:
+      - /node
+      - -id=node-1
+      - -db=/data/node-1.db
+      - -listen=:8080
+      - -central=central:9090
+      - -locations=A
+      - -sync-every=1s
+    # The distroless image has no writable filesystem, and the log is meant to be
+    # ephemeral: every `make demo` starts from an empty world.
+    tmpfs:
+      - /data
+    ports:
+      - "127.0.0.1:8081:8080"
+
+  node-2:
+    build: .
+    container_name: lf-node-2
+    networks: [lfnet, hostnet]
+    depends_on: [central]
+    command:
+      - /node
+      - -id=node-2
+      - -db=/data/node-2.db
+      - -listen=:8080
+      - -central=central:9090
+      - -locations=B
+      - -sync-every=1s
+    # The distroless image has no writable filesystem, and the log is meant to be
+    # ephemeral: every `make demo` starts from an empty world.
+    tmpfs:
+      - /data
+    ports:
+      - "127.0.0.1:8082:8080"
+
+  node-3:
+    build: .
+    container_name: lf-node-3
+    networks: [lfnet, hostnet]
+    depends_on: [central]
+    command:
+      - /node
+      - -id=node-3
+      - -db=/data/node-3.db
+      - -listen=:8080
+      - -central=central:9090
+      - -locations=C
+      - -sync-every=1s
+    # The distroless image has no writable filesystem, and the log is meant to be
+    # ephemeral: every `make demo` starts from an empty world.
+    tmpfs:
+      - /data
+    ports:
+      - "127.0.0.1:8083:8080"
