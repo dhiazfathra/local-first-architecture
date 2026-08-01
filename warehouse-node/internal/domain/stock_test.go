@@ -166,6 +166,16 @@ func TestDoPick(t *testing.T) {
 			cmd:      PickCmd{Line: Line{SKU: "WIDGET", LotID: "L1", Qty: 1, UoM: "EA"}, From: "NOWHERE", At: received},
 			wantRule: RuleLocationExists,
 		},
+		{
+			name:     "lot-tracked sku with no lot",
+			cmd:      PickCmd{Line: Line{SKU: "WIDGET", Qty: 1, UoM: "EA"}, From: "PICK-01", At: received},
+			wantRule: RuleLotRequired,
+		},
+		{
+			name:     "non-positive quantity",
+			cmd:      PickCmd{Line: Line{SKU: "WIDGET", LotID: "L1", Qty: 0, UoM: "EA"}, From: "PICK-01", At: received},
+			wantRule: RuleQtyPositive,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -205,7 +215,7 @@ func TestDoPickAllowsUntrackedLotForNonLotItem(t *testing.T) {
 	if err := s.Apply(e); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	events, err := DoPick(s, PickCmd{Line: Line{SKU: "BOLT", Qty: 2, UoM: "BOX"}, From: "PICK-01", At: time.Now()})
+	events, err := DoPick(s, PickCmd{Line: Line{SKU: "BOLT", Qty: 2, UoM: "BOX"}, From: "PICK-01", At: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

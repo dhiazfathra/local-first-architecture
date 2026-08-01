@@ -1,7 +1,6 @@
 package domain
 
 import (
-	"sort"
 	"testing"
 	"time"
 )
@@ -245,8 +244,9 @@ func TestDoCloseCountEmitsVarianceAdjustments(t *testing.T) {
 				}
 				got = append(got, e.Payload.(StockAdjusted))
 			}
-			sortAdjustments(got)
-			sortAdjustments(tt.wantAdj)
+			// Compared in emitted order, not sorted: tt.wantAdj is already written
+			// in the order DoCloseCount must emit it, so this also proves the
+			// ordering guarantee, not just set equality.
 			if len(got) != len(tt.wantAdj) {
 				t.Fatalf("got %d adjustments, want %d: %+v", len(got), len(tt.wantAdj), got)
 			}
@@ -266,13 +266,30 @@ func TestDoCloseCountEmitsVarianceAdjustments(t *testing.T) {
 	}
 }
 
-func sortAdjustments(a []StockAdjusted) {
-	sort.Slice(a, func(i, j int) bool {
-		if a[i].Move.SKU != a[j].Move.SKU {
-			return a[i].Move.SKU < a[j].Move.SKU
-		}
-		return a[i].Move.LotID < a[j].Move.LotID
-	})
+func TestDoCloseCountSortsByLocationWhenSKUAndLotTie(t *testing.T) {
+	// A single count's lines all share one Location in practice (DoCountLine
+	// always sets it from count.Location), so the sort comparator's Location
+	// tiebreak never fires through the command path. Seeding Counted directly
+	// exercises it anyway, proving the comparator is a total order rather than
+	// one that happens to work only because of that external invariant.
+	day := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	s := stocked(t, day)
+	applyEvents(t, s, 1650, day, Event{Type: TypeCountStarted, AggregateID: "C1",
+		Payload: CountStarted{CountID: "C1", Location: "PICK-01"}})
+	s.Counts["C1"].Counted[StockKey{SKU: "WIDGET", Location: "BULK-01", LotID: "L1"}] = 1
+	s.Counts["C1"].Counted[StockKey{SKU: "WIDGET", Location: "PICK-01", LotID: "L1"}] = 1
+
+	events, err := DoCloseCount(s, CloseCountCmd{CountID: "C1"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var got []StockAdjusted
+	for _, e := range events[:len(events)-1] {
+		got = append(got, e.Payload.(StockAdjusted))
+	}
+	if len(got) != 2 || got[0].Move.To != "BULK-01" || got[1].Move.From != "PICK-01" {
+		t.Fatalf("adjustments = %+v, want BULK-01 before PICK-01", got)
+	}
 }
 
 func TestDoCloseCountRejectsAlreadyClosed(t *testing.T) {

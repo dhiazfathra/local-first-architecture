@@ -20,7 +20,7 @@ func env(t *testing.T, seq uint64, typ, agg string, payload any) Envelope {
 // applyAll folds a sequence of envelopes into a fresh state, failing on error.
 func applyAll(t *testing.T, envs ...Envelope) *State {
 	t.Helper()
-	s := NewState()
+	s := NewTestState()
 	for _, e := range envs {
 		if err := s.Apply(e); err != nil {
 			t.Fatalf("Apply(%s): %v", e.Type, err)
@@ -178,6 +178,23 @@ func TestTransferStaysInFlightUntilReceived(t *testing.T) {
 	}
 }
 
+func TestTransferStaysInFlightOnPartialReceipt(t *testing.T) {
+	// Dispatched 3, received only 1: 2 remain in transit (Dispatched - Received,
+	// per TransferState's doc comment), so the transfer must not report complete.
+	s := applyAll(t,
+		env(t, 1, TypeTransferDispatched, "T1", TransferDispatched{
+			TransferID: "T1", FromNode: "wh-a", ToNode: "wh-b",
+			Lines: []Movement{{SKU: "WIDGET", From: "PICK-01", To: External, Qty: 3}},
+		}),
+		env(t, 2, TypeTransferReceived, "T1", TransferReceived{
+			TransferID: "T1", Lines: []Movement{{SKU: "WIDGET", From: External, To: "RECV-01", Qty: 1}},
+		}),
+	)
+	if got := s.Transfers["T1"].Status; got != TransferInFlight {
+		t.Fatalf("status = %q, want %q", got, TransferInFlight)
+	}
+}
+
 func TestSetHomeGatesTransferStockMovement(t *testing.T) {
 	// wh-b is the destination. Central relays the dispatch to wh-b purely for
 	// metadata; wh-b must not move stock at wh-a's PICK-01, since it does not
@@ -275,6 +292,45 @@ func TestStateItem(t *testing.T) {
 				t.Fatalf("Item(%q) err = %v, wantErr = %v", tt.sku, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestBackfillsLotExpiryWhenItemMasterArrivesAfterReceipt(t *testing.T) {
+	// The node receives a lot-tracked SKU before it has ever synced that SKU's
+	// item master, so registerLot cannot date expiry yet. Once ItemUpserted
+	// finally arrives, the lot must be backfilled rather than staying expiry-free
+	// forever.
+	s := applyAll(t,
+		env(t, 1, TypeGoodsReceived, "R1", GoodsReceived{ReceiptID: "R1",
+			Move: Movement{SKU: "WIDGET", LotID: "L1", From: External, To: "PICK-01", Qty: 10}}),
+	)
+	if lot := s.Lots["L1"]; !lot.ExpiresOn.IsZero() {
+		t.Fatalf("ExpiresOn = %v before item master arrives, want zero", lot.ExpiresOn)
+	}
+	if err := s.Apply(env(t, 2, TypeItemUpserted, "WIDGET", ItemUpserted{Item: widget()})); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	lot := s.Lots["L1"]
+	if want := time.Unix(1, 0).UTC().AddDate(0, 0, 30); !lot.ExpiresOn.Equal(want) {
+		t.Fatalf("ExpiresOn = %v, want %v", lot.ExpiresOn, want)
+	}
+}
+
+func TestStalePendingReceipts(t *testing.T) {
+	s := NewState()
+	buffered := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if err := s.Apply(env(t, 1, TypeTransferReceived, "T1", TransferReceived{
+		TransferID: "T1", Lines: []Movement{{SKU: "WIDGET", From: External, To: "RECV-01", Qty: 1}},
+	})); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	s.PendingReceipts["T1"][0].BufferedAt = buffered
+
+	if got := s.StalePendingReceipts(buffered.Add(time.Hour), 2*time.Hour); len(got) != 0 {
+		t.Fatalf("StalePendingReceipts = %v, want none yet", got)
+	}
+	if got := s.StalePendingReceipts(buffered.Add(3*time.Hour), 2*time.Hour); len(got) != 1 || got[0] != "T1" {
+		t.Fatalf("StalePendingReceipts = %v, want [T1]", got)
 	}
 }
 

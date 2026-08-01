@@ -48,15 +48,23 @@ func (i Item) ToBase(qty float64, u UoM) (float64, error) {
 	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor <= 0 {
 		return 0, Violation(RuleUoMValid, "uom %q of sku %s has conversion factor %v, which must be finite and positive", u, i.SKU, factor)
 	}
-	return qty * factor, nil
+	base := qty * factor
+	if math.IsInf(base, 0) {
+		return 0, Violation(RuleUoMValid, "uom %q of sku %s converts %v to a non-finite base quantity", u, i.SKU, qty)
+	}
+	return base, nil
 }
 
 // Lot is a received batch of one SKU with an expiry date. A zero ExpiresOn means
-// the lot never expires.
+// the lot never expires (either the item never had a shelf life, or one hasn't
+// been able to date it yet — see State.backfillLotExpiry).
 type Lot struct {
-	ID        string    `json:"id"`
-	SKU       string    `json:"sku"`
-	ExpiresOn time.Time `json:"expires_on"`
+	ID  string `json:"id"`
+	SKU string `json:"sku"`
+	// ReceivedAt is the instant this lot was first received, kept so expiry can
+	// still be dated correctly if the item master's shelf life arrives later.
+	ReceivedAt time.Time `json:"received_at"`
+	ExpiresOn  time.Time `json:"expires_on"`
 }
 
 // ExpiredAt reports whether the lot is past expiry at instant t. Expiry is a

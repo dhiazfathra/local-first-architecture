@@ -240,41 +240,11 @@ func DecodePayload(env Envelope) (any, error) {
 	return derefPayload(target), nil
 }
 
+// derefPayload dereferences the pointer a payloadFactories entry returned, so
+// callers see the payload struct by value. It works for any pointer type via
+// reflect rather than listing every registered payload type explicitly, so a
+// new event type added to payloadFactories can never fall through to a panic
+// here.
 func derefPayload(p any) any {
-	switch v := p.(type) {
-	case *GoodsReceived:
-		return *v
-	case *PutAway:
-		return *v
-	case *Picked:
-		return *v
-	case *StockAdjusted:
-		return *v
-	case *StockReserved:
-		return *v
-	case *ReservationReleased:
-		return *v
-	case *ReservationConsumed:
-		return *v
-	case *TransferDispatched:
-		return *v
-	case *TransferReceived:
-		return *v
-	case *ReceiptOpened:
-		return *v
-	case *ReceiptLineRecorded:
-		return *v
-	case *ReceiptClosed:
-		return *v
-	case *CountStarted:
-		return *v
-	case *CountLineCounted:
-		return *v
-	case *CountClosed:
-		return *v
-	case *ItemUpserted:
-		return *v
-	default:
-		return *(p.(*LocationRegistered))
-	}
+	return reflect.ValueOf(p).Elem().Interface()
 }

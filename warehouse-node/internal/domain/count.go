@@ -82,7 +82,10 @@ func DoCloseCount(s *State, c CloseCountCmd) ([]Event, error) {
 		if keys[i].SKU != keys[j].SKU {
 			return keys[i].SKU < keys[j].SKU
 		}
-		return keys[i].LotID < keys[j].LotID
+		if keys[i].LotID != keys[j].LotID {
+			return keys[i].LotID < keys[j].LotID
+		}
+		return keys[i].Location < keys[j].Location
 	})
 
 	events := make([]Event, 0, len(keys)+1)

@@ -56,6 +56,13 @@ func TestItemToBase(t *testing.T) {
 			uom:     "BAD",
 			wantErr: RuleUoMValid,
 		},
+		{
+			name:    "finite qty and factor whose product overflows to infinity is rejected",
+			item:    Item{SKU: "X", BaseUoM: "EA", AltUoM: map[UoM]float64{"BIG": 12}},
+			qty:     math.MaxFloat64,
+			uom:     "BIG",
+			wantErr: RuleUoMValid,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
