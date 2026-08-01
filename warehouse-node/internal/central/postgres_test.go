@@ -426,10 +426,25 @@ func TestRegisterNodePropagatesAClearRejectsError(t *testing.T) {
 
 // TestRegisterNodePropagatesARejectInsertError uses a NUL byte, which text columns
 // reject, to fail the loop's own insert without touching the two statements before it.
+// It also asserts the fix for the non-atomic RegisterNode: a node with an existing
+// reject set must keep that set intact when a later re-registration fails partway
+// through, rather than being left with the DELETE committed and no rejects at all.
 func TestRegisterNodePropagatesARejectInsertError(t *testing.T) {
+	ctx := context.Background()
 	store := freshPostgres(t)
-	if err := store.RegisterNode(context.Background(), "wh-a", []string{"bad\x00sku"}); err == nil {
+	if err := store.RegisterNode(ctx, "wh-a", []string{"HAZMAT"}); err != nil {
+		t.Fatalf("initial RegisterNode: %v", err)
+	}
+	if err := store.RegisterNode(ctx, "wh-a", []string{"HAZMAT", "bad\x00sku"}); err == nil {
 		t.Fatal("RegisterNode with a NUL byte in a reject SKU: expected an error")
+	}
+	rejects, known, err := store.NodeConfig(ctx, "wh-a")
+	if err != nil || !known {
+		t.Fatalf("NodeConfig after failed RegisterNode = known %v, err %v; want true, nil", known, err)
+	}
+	if !rejects["HAZMAT"] || len(rejects) != 1 {
+		t.Fatalf("rejects after failed re-registration = %+v, want unchanged {HAZMAT}: "+
+			"a mid-way failure must not leave the node with an empty reject set", rejects)
 	}
 }
 

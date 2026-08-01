@@ -204,12 +204,15 @@ func (m *Memory) Outbound(_ context.Context, target domain.NodeID, afterOrd uint
 	defer m.mu.Unlock()
 
 	out := []Outbound{}
+	if limit <= 0 {
+		return out, nil
+	}
 	for _, row := range m.queue[target] {
 		if row.Ord <= afterOrd {
 			continue
 		}
 		out = append(out, row)
-		if len(out) == limit {
+		if len(out) >= limit {
 			break
 		}
 	}
@@ -395,7 +398,15 @@ func (m *Memory) OpenTransfers(_ context.Context, dispatchedBefore time.Time) ([
 		}
 		out = append(out, row)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].TransferID < out[j].TransferID })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TransferID != out[j].TransferID {
+			return out[i].TransferID < out[j].TransferID
+		}
+		if out[i].Key.SKU != out[j].Key.SKU {
+			return out[i].Key.SKU < out[j].Key.SKU
+		}
+		return out[i].Key.LotID < out[j].Key.LotID
+	})
 	return out, nil
 }
 

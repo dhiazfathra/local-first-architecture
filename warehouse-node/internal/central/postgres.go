@@ -221,20 +221,33 @@ func (p *Postgres) hlcOf(ctx context.Context, id domain.EventID) (domain.HLC, bo
 	return domain.HLC{Wall: wall, Counter: uint32(counter), Node: domain.NodeID(node)}, true, nil
 }
 
+// cursorColumn is a closed set of the only column names cursor/setCursor may
+// interpolate into SQL, so a future caller passing an arbitrary string fails
+// loudly instead of reaching string concatenation.
+type cursorColumn string
+
+const (
+	columnPushedSeq    cursorColumn = "pushed_seq"
+	columnDeliveredOrd cursorColumn = "delivered_ord"
+)
+
 // PushedSeq is the highest sequence of a node's own events central has stored.
 func (p *Postgres) PushedSeq(ctx context.Context, node domain.NodeID) (uint64, error) {
-	return p.cursor(ctx, node, "pushed_seq")
+	return p.cursor(ctx, node, columnPushedSeq)
 }
 
 // DeliveredOrd is the highest outbound position a node has acknowledged.
 func (p *Postgres) DeliveredOrd(ctx context.Context, node domain.NodeID) (uint64, error) {
-	return p.cursor(ctx, node, "delivered_ord")
+	return p.cursor(ctx, node, columnDeliveredOrd)
 }
 
-func (p *Postgres) cursor(ctx context.Context, node domain.NodeID, column string) (uint64, error) {
+func (p *Postgres) cursor(ctx context.Context, node domain.NodeID, column cursorColumn) (uint64, error) {
+	if column != columnPushedSeq && column != columnDeliveredOrd {
+		return 0, fmt.Errorf("read cursor for %s: unknown column %q", node, column)
+	}
 	var value int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT `+column+` FROM cursors WHERE node_id = $1`, string(node)).Scan(&value)
+		`SELECT `+string(column)+` FROM cursors WHERE node_id = $1`, string(node)).Scan(&value)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return 0, nil
@@ -246,17 +259,20 @@ func (p *Postgres) cursor(ctx context.Context, node domain.NodeID, column string
 
 // SetPushedSeq records the highest sequence central has stored for a node.
 func (p *Postgres) SetPushedSeq(ctx context.Context, node domain.NodeID, seq uint64) error {
-	return p.setCursor(ctx, node, "pushed_seq", seq)
+	return p.setCursor(ctx, node, columnPushedSeq, seq)
 }
 
 // SetDeliveredOrd records the highest outbound position a node has acknowledged.
 func (p *Postgres) SetDeliveredOrd(ctx context.Context, node domain.NodeID, ord uint64) error {
-	return p.setCursor(ctx, node, "delivered_ord", ord)
+	return p.setCursor(ctx, node, columnDeliveredOrd, ord)
 }
 
-func (p *Postgres) setCursor(ctx context.Context, node domain.NodeID, column string, value uint64) error {
-	if _, err := p.pool.Exec(ctx, `INSERT INTO cursors (node_id, `+column+`) VALUES ($1, $2)
-		ON CONFLICT (node_id) DO UPDATE SET `+column+` = excluded.`+column,
+func (p *Postgres) setCursor(ctx context.Context, node domain.NodeID, column cursorColumn, value uint64) error {
+	if column != columnPushedSeq && column != columnDeliveredOrd {
+		return fmt.Errorf("set cursor for %s: unknown column %q", node, column)
+	}
+	if _, err := p.pool.Exec(ctx, `INSERT INTO cursors (node_id, `+string(column)+`) VALUES ($1, $2)
+		ON CONFLICT (node_id) DO UPDATE SET `+string(column)+` = excluded.`+string(column),
 		string(node), int64(value)); err != nil {
 		return fmt.Errorf("set %s for %s: %w", column, node, err)
 	}
@@ -278,8 +294,12 @@ func (p *Postgres) Enqueue(ctx context.Context, target domain.NodeID, envs []dom
 	return nil
 }
 
-// Outbound reads up to limit queued events for a node above afterOrd.
+// Outbound reads up to limit queued events for a node above afterOrd. A
+// non-positive limit returns an empty slice, never the unbounded queue.
 func (p *Postgres) Outbound(ctx context.Context, target domain.NodeID, afterOrd uint64, limit int) ([]Outbound, error) {
+	if limit <= 0 {
+		return []Outbound{}, nil
+	}
 	rows, err := p.pool.Query(ctx, `SELECT o.ord, e.node_id, e.seq, e.aggregate_id, e.type,
 		e.hlc_wall, e.hlc_counter, e.hlc_node, e.recorded_at, e.causation_node, e.causation_seq, e.payload
 		FROM outbound o JOIN events e ON e.node_id = o.node_id AND e.seq = o.seq
@@ -387,19 +407,33 @@ func (p *Postgres) PurchaseOrder(ctx context.Context, poRef, sku string) (float6
 }
 
 // RegisterNode records that a node exists and which SKUs it refuses to stock.
+// The reject-set replacement runs as one transaction: a mid-way insert failure
+// must never leave the DELETE committed with no compensating rejects, which
+// would otherwise let a dispatch of an item the node should refuse through
+// with no way to undo it.
 func (p *Postgres) RegisterNode(ctx context.Context, node domain.NodeID, rejects []string) error {
 	if _, err := p.pool.Exec(ctx,
 		`INSERT INTO nodes (node_id) VALUES ($1) ON CONFLICT (node_id) DO NOTHING`, string(node)); err != nil {
 		return fmt.Errorf("register node %s: %w", node, err)
 	}
-	if _, err := p.pool.Exec(ctx, `DELETE FROM node_rejects WHERE node_id = $1`, string(node)); err != nil {
+
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin register node %s: %w", node, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	if _, err := tx.Exec(ctx, `DELETE FROM node_rejects WHERE node_id = $1`, string(node)); err != nil {
 		return fmt.Errorf("clear rejects for %s: %w", node, err)
 	}
 	for _, sku := range rejects {
-		if _, err := p.pool.Exec(ctx, `INSERT INTO node_rejects (node_id, sku) VALUES ($1, $2)
+		if _, err := tx.Exec(ctx, `INSERT INTO node_rejects (node_id, sku) VALUES ($1, $2)
 			ON CONFLICT DO NOTHING`, string(node), sku); err != nil {
 			return fmt.Errorf("record reject %s for %s: %w", sku, node, err)
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit register node %s: %w", node, err)
 	}
 	return nil
 }

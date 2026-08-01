@@ -100,6 +100,11 @@ CREATE TABLE IF NOT EXISTS in_transit (
     PRIMARY KEY (transfer_id, sku, lot_id)
 );
 
+-- Supports OpenTransfers' scan, which otherwise walks every row in a table that
+-- grows with every dispatched transfer line.
+CREATE INDEX IF NOT EXISTS in_transit_open ON in_transit (dispatched_at)
+    WHERE failed = false AND dispatched - received > 0;
+
 -- One row per (event, transfer line) folded into an in-transit balance's received
 -- quantity, keyed by the event that produced it so a retried arbitration cannot
 -- double-add the same line's qty to the balance.

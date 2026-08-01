@@ -101,7 +101,8 @@ type Store interface {
 
 	// Enqueue adds events to a node's downstream queue.
 	Enqueue(ctx context.Context, target domain.NodeID, envs []domain.Envelope) error
-	// Outbound reads up to limit queued events for a node above afterOrd.
+	// Outbound reads up to limit queued events for a node above afterOrd. A
+	// non-positive limit returns an empty slice, never the unbounded queue.
 	Outbound(ctx context.Context, target domain.NodeID, afterOrd uint64, limit int) ([]Outbound, error)
 
 	UpsertItem(ctx context.Context, item domain.Item) error

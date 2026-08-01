@@ -3,6 +3,7 @@ package central
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -187,6 +188,14 @@ func runStoreContract(t *testing.T, open func(t *testing.T) Store) {
 		if len(limited) != 1 {
 			t.Fatalf("limited = %+v, want the limit respected", limited)
 		}
+		// A non-positive limit returns nothing, never the unbounded queue.
+		if zero, err := s.Outbound(ctx, "wh-b", 0, 0); err != nil || len(zero) != 0 {
+			t.Fatalf("Outbound with limit 0 = %+v, %v; want empty", zero, err)
+		}
+		if neg, err := s.Outbound(ctx, "wh-b", 0, -1); err != nil || len(neg) != 0 {
+			t.Fatalf("Outbound with limit -1 = %+v, %v; want empty", neg, err)
+		}
+
 		other, err := s.Outbound(ctx, "wh-a", 0, 10)
 		if err != nil {
 			t.Fatalf("Outbound(wh-a): %v", err)
@@ -467,7 +476,12 @@ func runStoreContract(t *testing.T, open func(t *testing.T) Store) {
 			t.Fatalf("unmarshal got: %v", err)
 		}
 		if len(got) != len(want) {
-			t.Errorf("payload = %v, want %v", got, want)
+			t.Fatalf("payload = %v, want %v", got, want)
+		}
+		for k, v := range want {
+			if !reflect.DeepEqual(got[k], v) {
+				t.Errorf("payload[%q] = %v, want %v", k, got[k], v)
+			}
 		}
 	})
 }
