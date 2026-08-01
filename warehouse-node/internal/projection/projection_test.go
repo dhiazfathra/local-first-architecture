@@ -639,6 +639,40 @@ func TestApplyFailsWhenRecordingAppliedIsBlocked(t *testing.T) {
 	}
 }
 
+// TestApplyFailsOnCommitWhenADeferredForeignKeyIsViolated hits Apply's tx.Commit()
+// error branch specifically: a deferred foreign key check passes at INSERT time
+// (deferral postpones it) but fails at commit, distinct from every other error
+// branch above which surfaces at the statement itself.
+func TestApplyFailsOnCommitWhenADeferredForeignKeyIsViolated(t *testing.T) {
+	l, set := openSet(t)
+	if _, err := l.DB().Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatalf("enable foreign_keys: %v", err)
+	}
+	if _, err := l.DB().Exec(`CREATE TABLE parents (id TEXT PRIMARY KEY)`); err != nil {
+		t.Fatalf("create parents: %v", err)
+	}
+	if _, err := l.DB().Exec(`CREATE TABLE projection_applied_children (
+		node_id TEXT NOT NULL, seq INTEGER NOT NULL, parent_id TEXT NOT NULL REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)`); err != nil {
+		t.Fatalf("create projection_applied_children: %v", err)
+	}
+	if _, err := l.DB().Exec(`CREATE TRIGGER defer_and_violate AFTER INSERT ON projection_applied
+		BEGIN
+			INSERT INTO projection_applied_children (node_id, seq, parent_id) VALUES (NEW.node_id, NEW.seq, 'missing-parent');
+		END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	if _, err := l.DB().Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
+		t.Fatalf("enable defer_foreign_keys: %v", err)
+	}
+	envs, err := l.Emit([]domain.Event{received("WIDGET", "L1", "RECV-01", 10)}, nil)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if err := set.Apply(envs[0]); err == nil {
+		t.Fatal("Apply: expected a commit error from the deferred foreign key violation")
+	}
+}
+
 // TestAddStockFailsOnTheCreditLeg hits addStock's second call specifically (the
 // credit at Movement.To) by constraining the table so only a chosen location can
 // violate it, proving the debit and credit legs are each error-checked rather than

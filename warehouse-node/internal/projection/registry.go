@@ -143,10 +143,6 @@ func (s *Set) Apply(env domain.Envelope) error {
 		ON CONFLICT (node_id, seq) DO NOTHING`, string(env.ID.NodeID), env.ID.Seq); err != nil {
 		return fmt.Errorf("record applied %s: %w", env.ID, err)
 	}
-	// Not covered: SQLite has no deferred constraints to violate at commit time,
-	// so provoking a commit-specific failure (as opposed to one of the statement
-	// errors already covered above) needs a fault-injection seam disproportionate
-	// to this task (parked, as eventlog's own DB-fault branches were).
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit projection tx: %w", err)
 	}
