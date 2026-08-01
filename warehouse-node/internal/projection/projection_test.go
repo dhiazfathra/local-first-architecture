@@ -562,9 +562,6 @@ func TestApplyStockAppliesTransferReceivedWithNoTransfersTableYet(t *testing.T) 
 // transfers-table-exists-but-no-matching-row fallback also applies the move.
 func TestApplyStockAppliesTransferReceivedWhenTransferRowIsMissing(t *testing.T) {
 	l, set := openSet(t)
-	if _, err := l.DB().Exec(`CREATE TABLE transfers (id TEXT PRIMARY KEY, to_node TEXT NOT NULL)`); err != nil {
-		t.Fatalf("create transfers: %v", err)
-	}
 	mv := domain.Movement{SKU: "WIDGET", LotID: "L1", From: domain.External, To: "RECV-01", Qty: 5}
 	emit(t, l, set, domain.Event{Type: domain.TypeTransferReceived, AggregateID: "T9",
 		Payload: domain.TransferReceived{TransferID: "T9", Lines: []domain.Movement{mv}}})
@@ -582,10 +579,9 @@ func TestApplyStockAppliesTransferReceivedWhenTransferRowIsMissing(t *testing.T)
 // isn't the real destination must not move that node's own stock.
 func TestApplyStockSkipsTransferReceivedRelayAtOtherNodes(t *testing.T) {
 	l, set := openSet(t) // home is "wh-a"
-	if _, err := l.DB().Exec(`CREATE TABLE transfers (id TEXT PRIMARY KEY, to_node TEXT NOT NULL)`); err != nil {
-		t.Fatalf("create transfers: %v", err)
-	}
-	if _, err := l.DB().Exec(`INSERT INTO transfers (id, to_node) VALUES ('T1', 'wh-b')`); err != nil {
+	if _, err := l.DB().Exec(`INSERT INTO transfers
+		(id, from_node, to_node, dispatched, received, status, dispatched_at)
+		VALUES ('T1', 'wh-a', 'wh-b', 5, 0, 'in_flight', '')`); err != nil {
 		t.Fatalf("seed transfers: %v", err)
 	}
 	mv := domain.Movement{SKU: "WIDGET", LotID: "L1", From: domain.External, To: "RECV-01", Qty: 5}

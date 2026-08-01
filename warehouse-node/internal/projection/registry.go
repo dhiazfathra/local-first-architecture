@@ -14,7 +14,8 @@ import (
 // Version is the projection schema/logic version. Bump it whenever the way any
 // projection is computed changes: Open then empties every projection table and
 // replays the whole log, which is only safe because replay is deterministic.
-const Version = 1
+// 2 added the exceptions and transfers read models.
+const Version = 2
 
 // projectionSchema creates the read-model tables. applied records, per originating
 // node, the highest sequence already folded in, which makes Apply idempotent.
@@ -41,11 +42,36 @@ CREATE TABLE IF NOT EXISTS projection_applied (
     seq     INTEGER NOT NULL,
     PRIMARY KEY (node_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS exceptions (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    caused_by   TEXT NOT NULL,
+    sku         TEXT NOT NULL,
+    location    TEXT NOT NULL,
+    lot_id      TEXT NOT NULL,
+    qty         REAL NOT NULL,
+    recorded_at TEXT NOT NULL,
+    resolved    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transfers (
+    id            TEXT PRIMARY KEY,
+    from_node     TEXT NOT NULL,
+    to_node       TEXT NOT NULL,
+    dispatched    REAL NOT NULL,
+    received      REAL NOT NULL,
+    status        TEXT NOT NULL,
+    dispatched_at TEXT NOT NULL
+);
 `
 
 // projectionTables is every table Rebuild empties. Adding a projection means adding
 // its table here.
-var projectionTables = []string{"stock_on_hand", "reservations", "projection_applied"}
+var projectionTables = []string{
+	"stock_on_hand", "reservations", "exceptions", "transfers", "projection_applied",
+}
 
 // Set is the collection of read models for one node, stored alongside its log.
 type Set struct {
@@ -137,6 +163,12 @@ func (s *Set) Apply(env domain.Envelope) error {
 		return err
 	}
 	if err := applyReservation(tx, payload); err != nil {
+		return err
+	}
+	if err := applyTransfer(tx, env, payload); err != nil {
+		return err
+	}
+	if err := applyException(tx, env, payload); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO projection_applied (node_id, seq) VALUES (?, ?)
