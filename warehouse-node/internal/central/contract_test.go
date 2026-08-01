@@ -270,6 +270,15 @@ func runStoreContract(t *testing.T, open func(t *testing.T) Store) {
 		if total, err = s.ReceivedAgainstPO(ctx, "PO-9", "WIDGET"); err != nil || total != 0 {
 			t.Fatalf("ReceivedAgainstPO for an unknown po = %v, %v; want 0, nil", total, err)
 		}
+		// Receipt reads one event's own contribution back, which is what a validator
+		// re-run by a crash-retry subtracts so it does not reject itself.
+		got, ok, err := s.Receipt(ctx, facts[0].EventID)
+		if err != nil || !ok || got != facts[0] {
+			t.Fatalf("Receipt = %+v, ok %v, err %v; want %+v, true, nil", got, ok, err, facts[0])
+		}
+		if _, ok, err = s.Receipt(ctx, domain.EventID{NodeID: "wh-z", Seq: 9}); err != nil || ok {
+			t.Fatalf("Receipt of an unrecorded event = ok %v, err %v; want false, nil", ok, err)
+		}
 	})
 
 	t.Run("delivery notes remember who keyed them first", func(t *testing.T) {
@@ -357,6 +366,21 @@ func runStoreContract(t *testing.T, open func(t *testing.T) Store) {
 		}
 		if err := s.AddReceived(ctx, domain.EventID{NodeID: "wh-b", Seq: 3}, "T9", key, 1); err == nil {
 			t.Error("AddReceived on an unknown transfer: expected an error")
+		}
+		// Each event's own folded quantity is readable back, so a crash-retried
+		// validator can exclude it from the balance instead of rejecting itself.
+		for _, tc := range []struct {
+			id   domain.EventID
+			want float64
+		}{
+			{domain.EventID{NodeID: "wh-b", Seq: 1}, 4},
+			{domain.EventID{NodeID: "wh-b", Seq: 2}, 2},
+			{domain.EventID{NodeID: "wh-b", Seq: 3}, 0},
+		} {
+			qty, err := s.ReceivedFromEvent(ctx, tc.id, "T1", key)
+			if err != nil || qty != tc.want {
+				t.Errorf("ReceivedFromEvent(%v) = %v, %v; want %v, nil", tc.id, qty, err, tc.want)
+			}
 		}
 	})
 

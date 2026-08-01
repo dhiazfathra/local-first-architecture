@@ -103,7 +103,7 @@ type poOverReceipt struct{}
 
 func (poOverReceipt) Name() string { return "po_over_receipt" }
 
-func (poOverReceipt) Validate(ctx context.Context, s central.Store, _ domain.Envelope, payload any) (*Rejection, error) {
+func (poOverReceipt) Validate(ctx context.Context, s central.Store, env domain.Envelope, payload any) (*Rejection, error) {
 	p, ok := payload.(domain.GoodsReceived)
 	if !ok {
 		return nil, nil
@@ -115,6 +115,19 @@ func (poOverReceipt) Validate(ctx context.Context, s central.Store, _ domain.Env
 	already, err := s.ReceivedAgainstPO(ctx, p.PORef, p.Move.SKU)
 	if err != nil {
 		return nil, err
+	}
+	// record's RecordReceipt runs before RecordDecision is persisted, so a retry
+	// after a crash in that window re-reaches this validator with its own quantity
+	// already summed into `already`. Left in, it would make an accepted receipt look
+	// like an over-receipt and compensate an event that was never wrong. Subtracting
+	// the event's own recorded contribution makes the verdict identical on every
+	// attempt. Same reasoning as duplicateDeliveryNote's first == env.ID check.
+	own, recorded, err := s.Receipt(ctx, env.ID)
+	if err != nil {
+		return nil, err
+	}
+	if recorded {
+		already -= own.QtyBase
 	}
 	excess := already + p.Move.Qty - ordered
 	if excess <= 0 {
@@ -180,7 +193,7 @@ type transferOverReceipt struct{}
 
 func (transferOverReceipt) Name() string { return "transfer_over_receipt" }
 
-func (transferOverReceipt) Validate(ctx context.Context, s central.Store, _ domain.Envelope, payload any) (*Rejection, error) {
+func (transferOverReceipt) Validate(ctx context.Context, s central.Store, env domain.Envelope, payload any) (*Rejection, error) {
 	p, ok := payload.(domain.TransferReceived)
 	if !ok {
 		return nil, nil
@@ -189,12 +202,21 @@ func (transferOverReceipt) Validate(ctx context.Context, s central.Store, _ doma
 	var excess float64
 	for _, m := range p.Lines {
 		var remaining float64
-		row, found, err := s.InTransit(ctx, p.TransferID, domain.StockKey{SKU: m.SKU, LotID: m.LotID})
+		key := domain.StockKey{SKU: m.SKU, LotID: m.LotID}
+		row, found, err := s.InTransit(ctx, p.TransferID, key)
 		if err != nil {
 			return nil, err
 		}
 		if found {
-			remaining = row.Dispatched - row.Received
+			// Add back whatever this same event already folded in on an earlier
+			// attempt that crashed before its decision was recorded: record runs
+			// AddReceived before RecordDecision, so a retry would otherwise see its
+			// own quantity as consuming the remaining balance and reject itself.
+			own, err := s.ReceivedFromEvent(ctx, env.ID, p.TransferID, key)
+			if err != nil {
+				return nil, err
+			}
+			remaining = row.Dispatched - (row.Received - own)
 		}
 		over := m.Qty - remaining
 		if over <= 0 {

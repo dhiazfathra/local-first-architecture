@@ -213,6 +213,13 @@ func TestPostgresOperationsFailAfterClose(t *testing.T) {
 	if _, _, err := store.InTransit(ctx, "T1", domain.StockKey{SKU: "WIDGET"}); err == nil {
 		t.Error("InTransit after Close: expected an error")
 	}
+	if _, _, err := store.Receipt(ctx, domain.EventID{NodeID: "wh-a", Seq: 1}); err == nil {
+		t.Error("Receipt after Close: expected an error")
+	}
+	if _, err := store.ReceivedFromEvent(ctx, domain.EventID{NodeID: "wh-a", Seq: 1}, "T1",
+		domain.StockKey{SKU: "WIDGET"}); err == nil {
+		t.Error("ReceivedFromEvent after Close: expected an error")
+	}
 	if err := store.FailTransfer(ctx, "T1"); err == nil {
 		t.Error("FailTransfer after Close: expected an error")
 	}

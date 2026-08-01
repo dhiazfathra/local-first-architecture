@@ -30,7 +30,10 @@ type Memory struct {
 	transit   map[string]InTransitRow
 	decisions map[domain.EventID]Decision
 	enqueued  map[string]bool
-	folded    map[string]bool
+	// folded records the quantity AddReceived already applied for one (event,
+	// SKU/lot), both as the idempotency marker and as the amount a retried
+	// validator must exclude from the balance.
+	folded map[string]float64
 }
 
 // NewMemory returns an empty in-memory store.
@@ -47,7 +50,7 @@ func NewMemory() *Memory {
 		transit:   map[string]InTransitRow{},
 		decisions: map[domain.EventID]Decision{},
 		enqueued:  map[string]bool{},
-		folded:    map[string]bool{},
+		folded:    map[string]float64{},
 	}
 }
 
@@ -283,6 +286,14 @@ func (m *Memory) RecordReceipt(_ context.Context, f ReceiptFact) error {
 	return nil
 }
 
+// Receipt reads back the fact recorded for one event.
+func (m *Memory) Receipt(_ context.Context, id domain.EventID) (ReceiptFact, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.receipts[id]
+	return f, ok, nil
+}
+
 // ReceivedAgainstPO sums every recorded receipt against a PO/SKU line, across all nodes.
 func (m *Memory) ReceivedAgainstPO(_ context.Context, poRef, sku string) (float64, error) {
 	m.mu.Lock()
@@ -348,13 +359,20 @@ func (m *Memory) AddReceived(_ context.Context, eventID domain.EventID, transfer
 		return fmt.Errorf("transfer %s has no dispatched line for %s/%s", transferID, k.SKU, k.LotID)
 	}
 	fk := eventKey(eventID, k)
-	if m.folded[fk] {
+	if _, done := m.folded[fk]; done {
 		return nil // already folded into the balance by an earlier attempt
 	}
-	m.folded[fk] = true
+	m.folded[fk] = qty
 	row.Received += qty
 	m.transit[key] = row
 	return nil
+}
+
+// ReceivedFromEvent is the quantity AddReceived already folded for one event and line.
+func (m *Memory) ReceivedFromEvent(_ context.Context, eventID domain.EventID, _ string, k domain.StockKey) (float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.folded[eventKey(eventID, k)], nil
 }
 
 // InTransit looks up the current in-transit balance for a transfer/key.

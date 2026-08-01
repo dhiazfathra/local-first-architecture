@@ -103,13 +103,19 @@ CREATE TABLE IF NOT EXISTS in_transit (
 -- One row per (event, transfer line) folded into an in-transit balance's received
 -- quantity, keyed by the event that produced it so a retried arbitration cannot
 -- double-add the same line's qty to the balance.
+-- qty is the amount folded, not just the fact that it was: a validator re-run by a
+-- crash-retry subtracts its own event's contribution from the balance so it reaches
+-- the same verdict it reached the first time instead of rejecting itself.
 CREATE TABLE IF NOT EXISTS transfer_receipts (
     event_node  TEXT NOT NULL,
     event_seq   BIGINT NOT NULL,
     sku         TEXT NOT NULL,
     lot_id      TEXT NOT NULL,
+    qty         DOUBLE PRECISION NOT NULL DEFAULT 0,
     PRIMARY KEY (event_node, event_seq, sku, lot_id)
 );
+
+ALTER TABLE transfer_receipts ADD COLUMN IF NOT EXISTS qty DOUBLE PRECISION NOT NULL DEFAULT 0;
 
 -- The arbitration audit trail: what central decided about each event, why, and which
 -- compensating event it emitted.

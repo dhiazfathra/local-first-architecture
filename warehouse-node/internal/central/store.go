@@ -116,6 +116,11 @@ type Store interface {
 	// double-count a receipt against its purchase order.
 	RecordReceipt(ctx context.Context, f ReceiptFact) error
 	ReceivedAgainstPO(ctx context.Context, poRef, sku string) (float64, error)
+	// Receipt reads back the fact recorded for one event, so a validator re-run by
+	// a crash-retry can subtract the event's own already-folded contribution from
+	// the aggregate it checks against and reach the same verdict it reached first
+	// time round.
+	Receipt(ctx context.Context, id domain.EventID) (ReceiptFact, bool, error)
 	// DeliveryNoteFirstSeen returns the event that first keyed this note for this
 	// SKU, which is how a duplicate is identified.
 	DeliveryNoteFirstSeen(ctx context.Context, note, sku string) (domain.EventID, bool, error)
@@ -124,6 +129,11 @@ type Store interface {
 	// AddReceived is idempotent per (event, SKU, lot): a retried arbitration that
 	// already folded eventID's line into the balance is a no-op the second time.
 	AddReceived(ctx context.Context, eventID domain.EventID, transferID string, k domain.StockKey, qty float64) error
+	// ReceivedFromEvent is the quantity AddReceived already folded into this
+	// transfer line on behalf of one event, or 0 if none. It is the transfer-side
+	// counterpart of Receipt: it lets a retried validator exclude its own
+	// contribution from the in-transit balance.
+	ReceivedFromEvent(ctx context.Context, eventID domain.EventID, transferID string, k domain.StockKey) (float64, error)
 	InTransit(ctx context.Context, transferID string, k domain.StockKey) (InTransitRow, bool, error)
 	// OpenTransfers returns transfers dispatched before the given instant that are
 	// still carrying stock. They are reported as discrepancies, never

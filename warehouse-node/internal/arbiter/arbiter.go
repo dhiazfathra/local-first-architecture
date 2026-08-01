@@ -111,9 +111,21 @@ func (a *Arbiter) Arbitrate(ctx context.Context, env domain.Envelope) (central.D
 		return decision, nil, a.store.RecordDecision(ctx, decision)
 	}
 
-	comps, err := a.store.EmitCentral(ctx, rejection.Events, &env.ID, a.now())
+	// EmitCentral is not idempotent: it allocates a fresh sequence, HLC and event ID
+	// on every call, so a retry after a crash between here and RecordDecision would
+	// mint a second, distinct compensation for the same rejection. The natural-key
+	// dedup on Enqueue cannot catch that — the two events have different IDs. The
+	// compensations already in the log, keyed by causation, are the idempotency
+	// marker: if any exist for this event, the earlier attempt got this far and they
+	// are replayed rather than re-emitted.
+	comps, err := a.compensationsOf(ctx, env.ID)
 	if err != nil {
 		return central.Decision{}, nil, err
+	}
+	if len(comps) == 0 {
+		if comps, err = a.store.EmitCentral(ctx, rejection.Events, &env.ID, a.now()); err != nil {
+			return central.Decision{}, nil, err
+		}
 	}
 	if err := a.store.Enqueue(ctx, env.ID.NodeID, comps); err != nil {
 		return central.Decision{}, nil, err

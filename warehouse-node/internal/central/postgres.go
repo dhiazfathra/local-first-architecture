@@ -462,6 +462,23 @@ func (p *Postgres) ReceivedAgainstPO(ctx context.Context, poRef, sku string) (fl
 	return total, nil
 }
 
+// Receipt reads back the fact recorded for one event.
+func (p *Postgres) Receipt(ctx context.Context, id domain.EventID) (ReceiptFact, bool, error) {
+	f := ReceiptFact{EventID: id}
+	var node string
+	err := p.pool.QueryRow(ctx, `SELECT node_id, po_ref, delivery_note, sku, qty_base FROM receipts
+		WHERE event_node = $1 AND event_seq = $2`, string(id.NodeID), int64(id.Seq)).
+		Scan(&node, &f.PORef, &f.DeliveryNote, &f.SKU, &f.QtyBase)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ReceiptFact{}, false, nil
+	case err != nil:
+		return ReceiptFact{}, false, fmt.Errorf("read receipt %s: %w", id, err)
+	}
+	f.Node = domain.NodeID(node)
+	return f, true, nil
+}
+
 // DeliveryNoteFirstSeen returns the event that first keyed this note for this SKU.
 func (p *Postgres) DeliveryNoteFirstSeen(ctx context.Context, note, sku string) (domain.EventID, bool, error) {
 	var node string
@@ -503,9 +520,9 @@ func (p *Postgres) AddReceived(ctx context.Context, eventID domain.EventID, tran
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
 
-	tag, err := tx.Exec(ctx, `INSERT INTO transfer_receipts (event_node, event_seq, sku, lot_id)
-		VALUES ($1,$2,$3,$4) ON CONFLICT (event_node, event_seq, sku, lot_id) DO NOTHING`,
-		string(eventID.NodeID), int64(eventID.Seq), k.SKU, k.LotID)
+	tag, err := tx.Exec(ctx, `INSERT INTO transfer_receipts (event_node, event_seq, sku, lot_id, qty)
+		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (event_node, event_seq, sku, lot_id) DO NOTHING`,
+		string(eventID.NodeID), int64(eventID.Seq), k.SKU, k.LotID, qty)
 	if err != nil {
 		return fmt.Errorf("record transfer receipt for %s: %w", transferID, err)
 	}
@@ -522,6 +539,17 @@ func (p *Postgres) AddReceived(ctx context.Context, eventID domain.EventID, tran
 		return fmt.Errorf("transfer %s has no dispatched line for %s/%s", transferID, k.SKU, k.LotID)
 	}
 	return tx.Commit(ctx)
+}
+
+// ReceivedFromEvent is the quantity AddReceived already folded for one event and line.
+func (p *Postgres) ReceivedFromEvent(ctx context.Context, eventID domain.EventID, _ string, k domain.StockKey) (float64, error) {
+	var qty float64
+	if err := p.pool.QueryRow(ctx, `SELECT coalesce(sum(qty), 0) FROM transfer_receipts
+		WHERE event_node = $1 AND event_seq = $2 AND sku = $3 AND lot_id = $4`,
+		string(eventID.NodeID), int64(eventID.Seq), k.SKU, k.LotID).Scan(&qty); err != nil {
+		return 0, fmt.Errorf("read folded receipt qty for %s: %w", eventID, err)
+	}
+	return qty, nil
 }
 
 // InTransit reads one in-transit balance.

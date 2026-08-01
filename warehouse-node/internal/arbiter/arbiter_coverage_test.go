@@ -89,6 +89,21 @@ func (f errFake) ReceivedAgainstPO(ctx context.Context, poRef, sku string) (floa
 	return f.Store.ReceivedAgainstPO(ctx, poRef, sku)
 }
 
+func (f errFake) Receipt(ctx context.Context, id domain.EventID) (central.ReceiptFact, bool, error) {
+	if err := f.fail("Receipt"); err != nil {
+		return central.ReceiptFact{}, false, err
+	}
+	return f.Store.Receipt(ctx, id)
+}
+
+func (f errFake) ReceivedFromEvent(ctx context.Context, id domain.EventID, transferID string,
+	k domain.StockKey) (float64, error) {
+	if err := f.fail("ReceivedFromEvent"); err != nil {
+		return 0, err
+	}
+	return f.Store.ReceivedFromEvent(ctx, id, transferID, k)
+}
+
 func (f errFake) NodeConfig(ctx context.Context, node domain.NodeID) (map[string]bool, bool, error) {
 	if err := f.fail("NodeConfig"); err != nil {
 		return nil, false, err
@@ -239,8 +254,13 @@ func TestArbitratePropagatesStoreErrors(t *testing.T) {
 		{name: "duplicateDeliveryNote validator", method: "DeliveryNoteFirstSeen", failOn: 1, event: goodReceipt()},
 		{name: "poOverReceipt validator's PurchaseOrder call", method: "PurchaseOrder", failOn: 1, event: goodReceipt()},
 		{name: "poOverReceipt validator's ReceivedAgainstPO call", method: "ReceivedAgainstPO", failOn: 1, event: goodReceipt()},
+		{name: "poOverReceipt validator's own-contribution Receipt call", method: "Receipt", failOn: 1, event: goodReceipt()},
 		{name: "transferDestination validator", method: "NodeConfig", failOn: 1, event: dispatch()},
 		{name: "transferOverReceipt validator", method: "InTransit", failOn: 1, event: receipt(4)},
+		{
+			name: "transferOverReceipt validator's ReceivedFromEvent call", method: "ReceivedFromEvent", failOn: 1,
+			seed: func(t *testing.T, a *Arbiter) { mustArbitrate(t, a, dispatch()) }, event: receipt(6),
+		},
 		{name: "record's RecordReceipt on acceptance", method: "RecordReceipt", failOn: 1, event: goodReceipt()},
 		{name: "record's RecordDispatch on acceptance", method: "RecordDispatch", failOn: 1, event: dispatch()},
 		{
@@ -256,6 +276,7 @@ func TestArbitratePropagatesStoreErrors(t *testing.T) {
 			seed: func(t *testing.T, a *Arbiter) { mustArbitrate(t, a, dispatch()) }, event: receipt(6),
 		},
 		{name: "fanOut's Enqueue on an accepted dispatch", method: "Enqueue", failOn: 1, event: dispatch()},
+		{name: "compensation replay check on a fresh rejection", method: "Events", failOn: 1, event: unknownSKUReceipt()},
 		{name: "EmitCentral on rejection", method: "EmitCentral", failOn: 1, event: unknownSKUReceipt()},
 		{name: "Enqueue of the compensation on rejection", method: "Enqueue", failOn: 1, event: unknownSKUReceipt()},
 		{name: "RecordDecision on acceptance", method: "RecordDecision", failOn: 1, event: goodReceipt()},
