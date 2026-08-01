@@ -120,26 +120,17 @@ func (s *Store) Merge(ctx context.Context, recs []Record, p Projector) (int, err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("eventlog: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	inserted, highestOwn := 0, s.nextSeq
-	// Project-then-commit happens per record, in order: a projector like
-	// domain.Inventory.Project snapshots state at Project-time and returns a
-	// commit func applying the next state. If we collected all commits and ran
-	// them after the loop, record N's Project would see pre-commit state for
-	// every earlier record in the batch, and only the last commit would stick.
+	// Each record gets its own transaction, exactly like Append: insert,
+	// project and commit that one record's tx before moving to the next. A
+	// later record's failure then leaves every earlier record both durably
+	// stored and reflected in the projector, never diverging — the batch-wide
+	// tx this replaced could commit() a record's in-memory effect and then
+	// have a later record's error roll every record's DB write back together.
 	for _, r := range recs {
-		res, err := exec(ctx, tx, r)
+		n, err := s.mergeOne(ctx, r, p)
 		if err != nil {
-			return 0, err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return 0, fmt.Errorf("eventlog: rows affected: %w", err)
+			return inserted, err
 		}
 		if n == 0 { // already held: nothing to project
 			continue
@@ -148,21 +139,45 @@ func (s *Store) Merge(ctx context.Context, recs []Record, p Projector) (int, err
 		if r.NodeID == s.nodeID && r.Seq > highestOwn {
 			highestOwn = r.Seq
 		}
-		if p != nil {
-			commit, err := p.Project(r)
-			if err != nil {
-				return 0, fmt.Errorf("eventlog: project %s/%d: %w", r.NodeID, r.Seq, err)
-			}
-			if commit != nil {
-				commit()
-			}
+		s.nextSeq = highestOwn
+	}
+	return inserted, nil
+}
+
+// mergeOne stores and, if new, projects a single record inside its own
+// transaction, returning 1 if it was newly inserted or 0 if it was a
+// duplicate.
+func (s *Store) mergeOne(ctx context.Context, r Record, p Projector) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("eventlog: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := exec(ctx, tx, r)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("eventlog: rows affected: %w", err)
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	var commit func()
+	if p != nil {
+		if commit, err = p.Project(r); err != nil {
+			return 0, fmt.Errorf("eventlog: project %s/%d: %w", r.NodeID, r.Seq, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("eventlog: commit: %w", err)
 	}
-	s.nextSeq = highestOwn
-	return inserted, nil
+	if commit != nil {
+		commit()
+	}
+	return 1, nil
 }
 
 func insert(ctx context.Context, tx *sql.Tx, r Record) error {

@@ -70,43 +70,56 @@ func (s *PGStore) Merge(ctx context.Context, recs []eventlog.Record, p eventlog.
 	if len(recs) == 0 {
 		return 0, nil
 	}
+	inserted := 0
+	// Each record gets its own transaction: insert, project and commit that
+	// one record before moving to the next. A later record's failure then
+	// leaves every earlier record both durably stored and reflected in the
+	// projector, never diverging — a single batch-wide tx could commit() a
+	// record's in-memory effect and then have a later record's error roll
+	// every record's DB write back together.
+	for _, r := range recs {
+		n, err := s.mergeOne(ctx, r, p)
+		if err != nil {
+			return inserted, err
+		}
+		inserted += n
+	}
+	return inserted, nil
+}
+
+// mergeOne stores and, if new, projects a single record inside its own
+// transaction, returning 1 if it was newly inserted or 0 if it was a
+// duplicate.
+func (s *PGStore) mergeOne(ctx context.Context, r eventlog.Record, p eventlog.Projector) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("central: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	inserted := 0
-	// Project-then-commit per record, in order: see the matching comment in
-	// eventlog.Store.Merge. Collecting commits and running them all after the
-	// loop would let record N's Project see pre-commit state for every
-	// earlier record in the batch, silently losing all but the last commit.
-	for _, r := range recs {
-		tag, err := tx.Exec(ctx,
-			`INSERT INTO records (node_id, seq, hlc_wall, hlc_logical, type, payload)
-			 VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (node_id, seq) DO NOTHING`,
-			r.NodeID, r.Seq, r.Clock.Wall, r.Clock.Logical, r.Type, r.Payload)
-		if err != nil {
-			return 0, fmt.Errorf("central: insert %s/%d: %w", r.NodeID, r.Seq, err)
-		}
-		if tag.RowsAffected() == 0 {
-			continue
-		}
-		inserted++
-		if p != nil {
-			commit, err := p.Project(r)
-			if err != nil {
-				return 0, fmt.Errorf("central: project %s/%d: %w", r.NodeID, r.Seq, err)
-			}
-			if commit != nil {
-				commit()
-			}
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO records (node_id, seq, hlc_wall, hlc_logical, type, payload)
+		 VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (node_id, seq) DO NOTHING`,
+		r.NodeID, r.Seq, r.Clock.Wall, r.Clock.Logical, r.Type, r.Payload)
+	if err != nil {
+		return 0, fmt.Errorf("central: insert %s/%d: %w", r.NodeID, r.Seq, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return 0, nil
+	}
+	var commit func()
+	if p != nil {
+		if commit, err = p.Project(r); err != nil {
+			return 0, fmt.Errorf("central: project %s/%d: %w", r.NodeID, r.Seq, err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("central: commit: %w", err)
 	}
-	return inserted, nil
+	if commit != nil {
+		commit()
+	}
+	return 1, nil
 }
 
 // Since returns every record the caller lacks according to vv, in replay order.
