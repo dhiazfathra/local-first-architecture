@@ -317,6 +317,28 @@ func TestRefreshNegativeFailsWhenExceptionsTableMissing(t *testing.T) {
 	}
 }
 
+// TestRefreshNegativeFailsWhenKeyTouchedTableMissing covers touchKey's error
+// return and refreshNegative's propagation of it, the same way
+// TestRefreshNegativeFailsWhenExceptionsTableMissing covers the exceptions
+// table: drop the table touchKey writes to and confirm the failure surfaces.
+func TestRefreshNegativeFailsWhenKeyTouchedTableMissing(t *testing.T) {
+	l, set := openSet(t)
+	emit(t, l, set, received("WIDGET", "L1", "RECV-01", 5))
+	if _, err := l.DB().Exec(`DROP TABLE key_touched`); err != nil {
+		t.Fatalf("drop key_touched: %v", err)
+	}
+	tx, err := l.DB().Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	key := domain.StockKey{SKU: "WIDGET", Location: "RECV-01", LotID: "L1"}
+	if err := refreshNegative(tx, domain.Envelope{RecordedAt: time.Now()}, key); err == nil {
+		t.Fatal("refreshNegative: expected an error with the key_touched table missing")
+	}
+}
+
 // findException fetches one exception row by ID or fails the test.
 func findException(t *testing.T, set *Set, id string) ExceptionRow {
 	t.Helper()

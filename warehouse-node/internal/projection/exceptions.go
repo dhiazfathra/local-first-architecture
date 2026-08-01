@@ -122,10 +122,6 @@ func touchKey(tx *sql.Tx, k domain.StockKey, env domain.Envelope) (string, error
 				THEN excluded.recorded_at ELSE key_touched.recorded_at END
 		RETURNING recorded_at`,
 		k.SKU, string(k.Location), k.LotID, env.RecordedAt.UTC().Format(time.RFC3339Nano)).Scan(&recordedAt)
-	// Not covered: this INSERT..ON CONFLICT..RETURNING always yields exactly one
-	// row, so the only way Scan fails here is a closed/exhausted pool — the same
-	// class of fault left unexercised elsewhere in this file (see Exceptions and
-	// refreshNegative) as disproportionate to reproduce.
 	if err != nil {
 		return "", fmt.Errorf("touch key %+v: %w", k, err)
 	}
