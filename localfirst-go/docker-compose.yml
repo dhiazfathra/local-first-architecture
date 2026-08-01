@@ -1,0 +1,8 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: localfirst
+      POSTGRES_PASSWORD: localfirst
+      POSTGRES_DB: localfirst
+    ports: ["5433:5432"]

@@ -1,7 +1,17 @@
+PG_DSN ?= postgres://localfirst:localfirst@127.0.0.1:5433/localfirst?sslmode=disable
+
+.PHONY: pg-up pg-down
+pg-up:
+	docker compose up -d postgres
+	@until docker compose exec -T postgres pg_isready -U localfirst >/dev/null 2>&1; do sleep 0.3; done
+
+pg-down:
+	docker compose rm -sf postgres
+
 .PHONY: test lint proto demo demo-down
 
-test:
-	CGO_ENABLED=0 go test ./... -cover
+test: pg-up
+	LOCALFIRST_PG_DSN="$(PG_DSN)" CGO_ENABLED=0 go test ./... -cover
 
 lint:
 	golangci-lint run
