@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/dhiazfathra/local-first-architecture/localfirst-go/central"
@@ -169,6 +170,40 @@ type recorder struct{ committed []eventlog.Record }
 
 func (r *recorder) Project(rec eventlog.Record) (func(), error) {
 	return func() { r.committed = append(r.committed, rec) }, nil
+}
+
+// TestMergeMultiRecordBatchProjectsEveryRecordThroughARealProjector uses a
+// real stateful projector (domain.Inventory) rather than recorder (which only
+// records, and would not catch cross-record ordering bugs). It reproduces the
+// bug where Merge ran every record's Project before any commit: the second
+// and third records would see the first's pre-commit balance, and only the
+// last commit would stick, silently losing the earlier records' effects.
+func TestMergeMultiRecordBatchProjectsEveryRecordThroughARealProjector(t *testing.T) {
+	ctx, s := context.Background(), pgStore(t)
+	store, err := eventlog.Open(filepath.Join(t.TempDir(), "inv.db"), "central")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	inv, err := domain.NewInventory(ctx, store, clock.New("central", nil), nil)
+	if err != nil {
+		t.Fatalf("NewInventory: %v", err)
+	}
+
+	batch := []eventlog.Record{
+		received(t, "n1", 1, "A", 5),
+		received(t, "n2", 1, "A", 3),
+		received(t, "n3", 1, "A", 2),
+	}
+	n, err := s.Merge(ctx, batch, inv)
+	if err != nil || n != 3 {
+		t.Fatalf("Merge = (%d, %v), want (3, nil)", n, err)
+	}
+	if got := inv.Balance("S", "A"); got != 10 {
+		t.Fatalf("Balance = %d, want 10 (5+3+2): a buggy Merge that projects "+
+			"all records before committing any of them would leave only the "+
+			"last record's effect", got)
+	}
 }
 
 // TestOpenPGRejectsAMalformedDSN reaches pgxpool.New's synchronous error path.

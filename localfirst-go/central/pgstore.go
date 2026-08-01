@@ -77,7 +77,10 @@ func (s *PGStore) Merge(ctx context.Context, recs []eventlog.Record, p eventlog.
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	inserted := 0
-	var commits []func()
+	// Project-then-commit per record, in order: see the matching comment in
+	// eventlog.Store.Merge. Collecting commits and running them all after the
+	// loop would let record N's Project see pre-commit state for every
+	// earlier record in the batch, silently losing all but the last commit.
 	for _, r := range recs {
 		tag, err := tx.Exec(ctx,
 			`INSERT INTO records (node_id, seq, hlc_wall, hlc_logical, type, payload)
@@ -95,14 +98,13 @@ func (s *PGStore) Merge(ctx context.Context, recs []eventlog.Record, p eventlog.
 			if err != nil {
 				return 0, fmt.Errorf("central: project %s/%d: %w", r.NodeID, r.Seq, err)
 			}
-			commits = append(commits, commit)
+			if commit != nil {
+				commit()
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("central: commit: %w", err)
-	}
-	for _, c := range commits {
-		c()
 	}
 	return inserted, nil
 }

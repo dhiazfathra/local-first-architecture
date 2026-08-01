@@ -161,6 +161,7 @@ func (l *List) Project(r eventlog.Record) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	l.clk.Observe(r.Clock)
 	return func() {
 		l.mu.Lock()
 		l.state = next
@@ -173,6 +174,11 @@ func (l *List) Project(r eventlog.Record) (func(), error) {
 same thing for negative balances. The deferred `commit func()` is why a
 transaction that fails to commit cannot leave the in-memory projection ahead of
 the log.
+
+`Project` is also the required place to call `l.clk.Observe(r.Clock)` — it runs
+for every record the node ever accepts, local or synced, and is what makes
+ADR 0003's clock-monotonicity promise hold for this domain too (see
+`domain.Inventory.Project` for the same pattern).
 
 Note the lock is `l.mu`, held only inside `Check` and `Project` themselves —
 not around the call to `Store.Append`. A background `eventlog.Merge` (a record

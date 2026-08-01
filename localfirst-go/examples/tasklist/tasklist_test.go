@@ -273,3 +273,49 @@ func TestFoldOverTheStore(t *testing.T) {
 		t.Fatalf("folded %v, want t1 titled a", got)
 	}
 }
+
+// TestProjectObservesPeerClockBeforeNextLocalAppend mirrors
+// domain_test.TestMergeObservesPeerClockBeforeNextLocalAppend: it proves ADR
+// 0003's promise holds for this domain too — after merging a record with a
+// future timestamp, this node's own next record sorts after it.
+func TestProjectObservesPeerClockBeforeNextLocalAppend(t *testing.T) {
+	list, store, _ := newList(t)
+	ctx := context.Background()
+
+	future := eventlog.Record{
+		NodeID:  "n2",
+		Seq:     1,
+		Clock:   clock.HLC{Wall: time.Now().UnixMilli() + 1_000_000, NodeID: "n2"},
+		Type:    tasklist.TypeAdded,
+		Payload: mustJSON(t, tasklist.Added{ID: "remote", Title: "from n2"}),
+	}
+	if _, err := store.Merge(ctx, []eventlog.Record{future}, list); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if err := list.Add(ctx, "t1", "local"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	recs, err := store.Since(ctx, nil)
+	if err != nil {
+		t.Fatalf("Since: %v", err)
+	}
+	var local eventlog.Record
+	for _, r := range recs {
+		if r.NodeID == "n1" {
+			local = r
+		}
+	}
+	if c := future.Clock.Compare(local.Clock); c >= 0 {
+		t.Fatalf("local record's clock did not advance past the merged future one: future=%+v local=%+v", future.Clock, local.Clock)
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}

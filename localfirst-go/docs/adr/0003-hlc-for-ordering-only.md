@@ -29,6 +29,10 @@ Use a hybrid logical clock: `clock.HLC{Wall int64; Logical uint32; NodeID string
 - `clock.Clock.Observe(remote)` pulls the local clock up to any peer timestamp
   seen during sync, so a node's own future timestamps sort after everything it
   has already learned.
+- The required call site for `Observe` is a domain's `eventlog.Projector.Project`
+  implementation (see `domain.Inventory.Project`), because it runs for every
+  record the node ever accepts, local or synced — any new domain must observe
+  the clock there too, or this ADR's promise silently does not hold for it.
 
 **And that is all it is used for: ordering and audit.** It is deliberately
 *not* used for conflict resolution.

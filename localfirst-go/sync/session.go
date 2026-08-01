@@ -146,15 +146,13 @@ func drain(ctx context.Context, log Log, p eventlog.Projector, s Stream) error {
 		}
 		switch body := frame.GetBody().(type) {
 		case *syncpb.Frame_Batch:
-			for _, pb := range body.Batch.GetRecords() {
-				// ponytail: merge one record per call. Store.Merge defers its
-				// projection commit funcs until after the transaction, so a
-				// single multi-record Merge projects every next against the
-				// pre-batch state and the last commit overwrites the earlier
-				// records' effects. Per-record merges chain them correctly.
-				if _, err := log.Merge(ctx, []eventlog.Record{RecordFromPB(pb)}, p); err != nil {
-					return err
-				}
+			pbRecs := body.Batch.GetRecords()
+			recs := make([]eventlog.Record, len(pbRecs))
+			for i, pb := range pbRecs {
+				recs[i] = RecordFromPB(pb)
+			}
+			if _, err := log.Merge(ctx, recs, p); err != nil {
+				return err
 			}
 		case *syncpb.Frame_Ack:
 			return nil

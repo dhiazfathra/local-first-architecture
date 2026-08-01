@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,6 +167,47 @@ func TestMergeIsIdempotent(t *testing.T) {
 	}
 	if len(p.committed) != 3 {
 		t.Fatalf("projected %d records, want 3 (duplicates must not re-project)", len(p.committed))
+	}
+}
+
+// sumProjector is a minimal *stateful* projector: each record adds its
+// payload byte value to a running total, and Project snapshots the current
+// total before computing next — exactly the domain.Inventory pattern. Unlike
+// countProjector (which only counts and can't observe cross-record ordering
+// bugs), this catches Merge running every Project before any commit: the
+// second record would see the pre-commit total and its effect would be lost.
+type sumProjector struct {
+	mu    sync.Mutex
+	total int
+}
+
+func (p *sumProjector) Project(r eventlog.Record) (func(), error) {
+	p.mu.Lock()
+	staged := p.total + int(r.Payload[0])
+	p.mu.Unlock()
+	return func() {
+		p.mu.Lock()
+		p.total = staged
+		p.mu.Unlock()
+	}, nil
+}
+
+func TestMergeMultiRecordBatchProjectsEveryRecord(t *testing.T) {
+	ctx, s := context.Background(), open(t, "n1")
+	p := &sumProjector{}
+	recs := []eventlog.Record{
+		{NodeID: "n2", Seq: 1, Clock: clock.HLC{Wall: 1, NodeID: "n2"}, Type: "T", Payload: []byte{1}},
+		{NodeID: "n2", Seq: 2, Clock: clock.HLC{Wall: 2, NodeID: "n2"}, Type: "T", Payload: []byte{2}},
+		{NodeID: "n2", Seq: 3, Clock: clock.HLC{Wall: 3, NodeID: "n2"}, Type: "T", Payload: []byte{3}},
+	}
+	n, err := s.Merge(ctx, recs, p)
+	if err != nil || n != 3 {
+		t.Fatalf("Merge = (%d, %v), want (3, nil)", n, err)
+	}
+	if p.total != 6 {
+		t.Fatalf("total = %d, want 6 (1+2+3): a buggy Merge that projects all "+
+			"records before committing any of them would leave only the last "+
+			"record's effect, total = 3", p.total)
 	}
 }
 

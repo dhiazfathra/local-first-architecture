@@ -158,6 +158,12 @@ func (l *List) Check(r eventlog.Record) error {
 // Project is eventlog.Projector: compute the next state, and hand back a
 // closure the store runs only after the transaction commits. If the commit
 // fails, l.state is untouched.
+//
+// It also observes r's clock. Project runs for every record this node ever
+// projects, local or synced in from a peer, which makes it the one place
+// guaranteed to see every timestamp the node learns about. Folding a peer's
+// HLC in here is what makes ADR 0003's promise true: after merging a
+// record with a future timestamp, this node's own next Now() sorts after it.
 func (l *List) Project(r eventlog.Record) (func(), error) {
 	l.mu.RLock()
 	trial := l.state
@@ -166,6 +172,7 @@ func (l *List) Project(r eventlog.Record) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	l.clk.Observe(r.Clock)
 	return func() {
 		l.mu.Lock()
 		l.state = next

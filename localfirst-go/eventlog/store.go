@@ -127,7 +127,11 @@ func (s *Store) Merge(ctx context.Context, recs []Record, p Projector) (int, err
 	defer func() { _ = tx.Rollback() }()
 
 	inserted, highestOwn := 0, s.nextSeq
-	var commits []func()
+	// Project-then-commit happens per record, in order: a projector like
+	// domain.Inventory.Project snapshots state at Project-time and returns a
+	// commit func applying the next state. If we collected all commits and ran
+	// them after the loop, record N's Project would see pre-commit state for
+	// every earlier record in the batch, and only the last commit would stick.
 	for _, r := range recs {
 		res, err := exec(ctx, tx, r)
 		if err != nil {
@@ -149,14 +153,13 @@ func (s *Store) Merge(ctx context.Context, recs []Record, p Projector) (int, err
 			if err != nil {
 				return 0, fmt.Errorf("eventlog: project %s/%d: %w", r.NodeID, r.Seq, err)
 			}
-			commits = append(commits, commit)
+			if commit != nil {
+				commit()
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("eventlog: commit: %w", err)
-	}
-	for _, c := range commits {
-		c()
 	}
 	s.nextSeq = highestOwn
 	return inserted, nil

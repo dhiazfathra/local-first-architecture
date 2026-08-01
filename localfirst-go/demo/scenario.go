@@ -128,7 +128,7 @@ func Run(ctx context.Context, env Env, out io.Writer) (Result, error) {
 
 	// Step 4 -------------------------------------------------------------
 	_, _ = fmt.Fprintf(out, "\nstep 4/7  issuing %d units, one at a time, against the isolated node\n", OfflineOps)
-	for i := 0; i < OfflineOps; i++ {
+	for i := range OfflineOps {
 		if err := iso.Issue(ctx, SKU, iso.Location(), 1); err != nil {
 			res.OfflineFailed++
 			_, _ = fmt.Fprintf(out, "          op %2d FAILED: %v\n", i+1, err)
