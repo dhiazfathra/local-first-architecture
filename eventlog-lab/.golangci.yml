@@ -1,0 +1,20 @@
+version: "2"
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - errorlint
+    - bodyclose
+    - sqlclosecheck
+    - rowserrcheck
+  exclusions:
+    rules:
+      - path: sync/syncpb/
+        linters: [revive, staticcheck]
+formatters:
+  enable:
+    - gofmt
