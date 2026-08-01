@@ -33,3 +33,4 @@ go.work.sum
 
 # Subagent-driven-development scratch workspace
 .superpowers/
+.worktrees/
