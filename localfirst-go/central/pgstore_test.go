@@ -3,6 +3,7 @@ package central_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"testing"
 
@@ -168,4 +169,33 @@ type recorder struct{ committed []eventlog.Record }
 
 func (r *recorder) Project(rec eventlog.Record) (func(), error) {
 	return func() { r.committed = append(r.committed, rec) }, nil
+}
+
+// TestOpenPGRejectsAMalformedDSN reaches pgxpool.New's synchronous error path.
+// A bad DSN normally fails lazily on first use; only a URL that fails to parse
+// makes the pool constructor itself return an error.
+func TestOpenPGRejectsAMalformedDSN(t *testing.T) {
+	if _, err := central.OpenPG(context.Background(), "postgres://%zz@127.0.0.1:5433/db", "central"); err == nil {
+		t.Fatal("OpenPG must fail when the DSN cannot be parsed")
+	}
+}
+
+type errProjector struct{}
+
+func (errProjector) Project(eventlog.Record) (func(), error) { return nil, errors.New("boom") }
+
+// TestMergeFailsWhenProjectionFails covers the projector error path inside
+// Merge, and proves the transaction rolled back: the record must not persist.
+func TestMergeFailsWhenProjectionFails(t *testing.T) {
+	ctx, s := context.Background(), pgStore(t)
+	if _, err := s.Merge(ctx, []eventlog.Record{received(t, "n1", 1, "A", 1)}, errProjector{}); err == nil {
+		t.Fatal("Merge must fail when the projector errors")
+	}
+	all, err := s.Since(ctx, nil)
+	if err != nil {
+		t.Fatalf("Since: %v", err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("Merge did not roll back: %d records persisted, want 0", len(all))
+	}
 }
