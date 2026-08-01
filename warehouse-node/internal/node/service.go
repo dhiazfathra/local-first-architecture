@@ -63,12 +63,6 @@ func Open(path string, id domain.NodeID, now func() time.Time) (*Service, error)
 func (s *Service) rebuildState() error {
 	envs, err := s.log.ReadAll()
 	if err != nil {
-		// Not covered: by the time rebuildState runs, apply() has already run
-		// Emit/Ingest (which itself requires the events table to insert into) and
-		// successfully folded the same envelopes into the projections, so there is
-		// no fault-injection seam that breaks ReadAll here without also breaking an
-		// earlier step in the same call — see Task 10/11 reports for the same
-		// category of parked branch.
 		return err
 	}
 	fresh := domain.NewState()

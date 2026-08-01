@@ -280,6 +280,23 @@ func TestOpenFailsWhenLogCannotBeReplayedIntoState(t *testing.T) {
 	}
 }
 
+func TestExecuteFailsWhenRebuildStateCannotReadAnAlreadyCommittedRow(t *testing.T) {
+	svc := openService(t, "wh-a")
+	if err := svc.RegisterLocation("RECV-01", domain.LocReceiving); err != nil {
+		t.Fatalf("RegisterLocation: %v", err)
+	}
+	if _, err := svc.Log().DB().Exec(`UPDATE events SET recorded_at = 'not-a-time' WHERE seq = 1`); err != nil {
+		t.Fatalf("corrupt recorded_at: %v", err)
+	}
+
+	if _, err := svc.Execute(func(*domain.State) ([]domain.Event, error) {
+		return []domain.Event{{Type: domain.TypeLocationRegistered, AggregateID: "X",
+			Payload: domain.LocationRegistered{Code: "X-01", Type: domain.LocPick}}}, nil
+	}); err == nil {
+		t.Fatal("Execute: expected an error rebuilding state from an already-committed corrupted row")
+	}
+}
+
 func TestRegisterLocationRejectsUnknownType(t *testing.T) {
 	svc := openService(t, "wh-a")
 	err := svc.RegisterLocation("BAD-01", domain.LocationType("bogus"))
