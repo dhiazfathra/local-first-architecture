@@ -60,8 +60,14 @@ func (m *MemoryTransport) Dial(ctx context.Context, addr string) (Stream, error)
 		return nil, fmt.Errorf("memory transport: no server at %q", addr)
 	}
 
+	// A session context child of ctx: closing it from Close ends the server
+	// goroutine even when the caller abandons the session without ever
+	// reaching CloseSend, so an early-exit client can't leave the server
+	// blocked in Recv for the lifetime of ctx.
+	sessionCtx, cancel := context.WithCancel(ctx)
 	p := &memPipe{
-		ctx:      ctx,
+		ctx:      sessionCtx,
+		cancel:   cancel,
 		toServer: make(chan *syncpb.ClientFrame, 1024),
 		toClient: make(chan *syncpb.ServerFrame, 1024),
 		done:     make(chan struct{}),
@@ -71,7 +77,7 @@ func (m *MemoryTransport) Dial(ctx context.Context, addr string) (Stream, error)
 	go func() {
 		defer close(p.done)
 		defer close(p.toClient)
-		p.serverErr = srv.Session(ctx, (*memServerSide)(p))
+		p.serverErr = srv.Session(sessionCtx, (*memServerSide)(p))
 	}()
 	return (*memClientSide)(p), nil
 }
@@ -79,6 +85,7 @@ func (m *MemoryTransport) Dial(ctx context.Context, addr string) (Stream, error)
 // memPipe is a bidirectional in-memory frame pipe.
 type memPipe struct {
 	ctx       context.Context
+	cancel    context.CancelFunc
 	toServer  chan *syncpb.ClientFrame
 	toClient  chan *syncpb.ServerFrame
 	done      chan struct{}
@@ -147,9 +154,16 @@ func (s *memClientSide) CloseSend() error {
 	return nil
 }
 
-// Close is a no-op: the in-memory transport holds no resource beyond the
-// channels and goroutine already released by CloseSend or ctx cancellation.
-func (s *memClientSide) Close() error { return nil }
+// Close ends the session's goroutine and channels via its cancel function.
+// It must run on every exit path, not only the one that reaches CloseSend:
+// otherwise an abandoned session (SyncOnce failing before CloseSend) leaves
+// the server goroutine blocked in memServerSide.Recv for the lifetime of the
+// caller's ctx. Cancelling twice (CloseSend's normal close, then this defer)
+// is safe -- context.CancelFunc is idempotent.
+func (s *memClientSide) Close() error {
+	(*memPipe)(s).cancel()
+	return nil
+}
 
 type memServerSide memPipe
 

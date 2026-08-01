@@ -274,7 +274,7 @@ func TestClientToleratesPeerSendingAMalformedEvent(t *testing.T) {
 	dialer := failingDialer{frames: []*syncpb.ServerFrame{
 		{Body: &syncpb.ServerFrame_Welcome{Welcome: &syncpb.Welcome{NodeId: "B"}}},
 		{Body: &syncpb.ServerFrame_Events{Events: &syncpb.Events{Events: []*syncpb.Event{{NodeId: "B", Seq: 1, Sku: "S", Kind: 99}}}}},
-		{Body: &syncpb.ServerFrame_Ack{Ack: &syncpb.Ack{}}},
+		{Body: &syncpb.ServerFrame_Ack{Ack: &syncpb.Ack{VersionVector: map[string]uint64{"B": 1}}}},
 	}}
 	rep, err := NewClient(a, dialer, 8).SyncOnce(ctx, "peer")
 	if err != nil {
@@ -285,6 +285,11 @@ func TestClientToleratesPeerSendingAMalformedEvent(t *testing.T) {
 	}
 	if rep.Received != 0 {
 		t.Errorf("Received = %d, want 0", rep.Received)
+	}
+	// The rejected event was never applied locally, so the cursor must not
+	// advance on the strength of the peer's advertised (unearned) vector.
+	if got, err := a.Log().Cursor(ctx, "B"); err != nil || got != 0 {
+		t.Fatalf("Cursor(B) = %d, %v; want 0, nil", got, err)
 	}
 }
 

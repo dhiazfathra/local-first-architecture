@@ -79,7 +79,10 @@ func (c *Client) SyncOnce(ctx context.Context, addr string) (Report, error) {
 	if err := st.CloseSend(); err != nil {
 		return Report{}, fmt.Errorf("sync client: close send: %w", err)
 	}
-	if err := c.replica.Log().SetCursor(ctx, rep.PeerID, rep.PeerVV[rep.PeerID]); err != nil {
+	// after[rep.PeerID], not rep.PeerVV[rep.PeerID]: the peer's advertised
+	// vector includes events we rejected as malformed and never applied, so
+	// the cursor must track what we actually merged.
+	if err := c.replica.Log().SetCursor(ctx, rep.PeerID, after[rep.PeerID]); err != nil {
 		return Report{}, fmt.Errorf("sync client: %w", err)
 	}
 	return rep, nil
