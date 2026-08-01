@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/arbiter"
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/central"
@@ -67,7 +70,18 @@ func realMain() error {
 	window := fs.Duration("transit-window", 48*time.Hour,
 		"how long a transfer may be in transit before it is reported as a discrepancy")
 	every := fs.Duration("report-every", time.Hour, "interval between discrepancy reports")
+	tlsCert := fs.String("tls-cert", "", "path to this server's TLS certificate (PEM)")
+	tlsKey := fs.String("tls-key", "", "path to this server's TLS private key (PEM)")
+	tlsClientCA := fs.String("tls-client-ca", "",
+		"path to the CA (PEM) that signs node client certificates, required to authenticate them")
+	insecureNoTLS := fs.Bool("insecure", false,
+		"serve the replication stream in plaintext with no peer authentication; for local development only")
 	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+
+	creds, err := serverCredentials(*tlsCert, *tlsKey, *tlsClientCA, *insecureNoTLS)
+	if err != nil {
 		return err
 	}
 
@@ -87,7 +101,39 @@ func realMain() error {
 	}
 	defer func() { _ = store.Close() }()
 
-	return run(ctx, store, b, *window, *every, time.Now, lis)
+	return run(ctx, store, b, *window, *every, time.Now, lis, creds)
+}
+
+// serverCredentials builds the replication stream's transport credentials. By
+// default it requires mTLS: a server certificate plus a client CA so every
+// connecting node presents a certificate the server can verify, closing the gap
+// where a stream's identity otherwise comes only from the client-supplied
+// Hello.node_id. insecureNoTLS opts out for local development, never by default.
+func serverCredentials(certPath, keyPath, clientCAPath string, insecureNoTLS bool) (credentials.TransportCredentials, error) {
+	if insecureNoTLS {
+		log.Print("central: -insecure set, serving the replication stream in plaintext with no peer authentication")
+		return nil, nil
+	}
+	if certPath == "" || keyPath == "" || clientCAPath == "" {
+		return nil, fmt.Errorf("-tls-cert, -tls-key and -tls-client-ca are required unless -insecure is set")
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load server TLS certificate: %w", err)
+	}
+	caPEM, err := os.ReadFile(clientCAPath)
+	if err != nil {
+		return nil, fmt.Errorf("read client CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("client CA %s contains no usable certificates", clientCAPath)
+	}
+	return credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+	}), nil
 }
 
 // loadBootstrap reads the configuration file. An empty path means no reference data,
@@ -155,16 +201,20 @@ func reportDiscrepancies(ctx context.Context, s central.Store, window time.Durat
 }
 
 // run seeds the store, starts the discrepancy report loop, and serves the sync stream
-// until ctx is done.
+// until ctx is done. creds is nil only when the caller opted into -insecure.
 func run(ctx context.Context, s central.Store, b Bootstrap, window, every time.Duration,
-	now func() time.Time, lis net.Listener) error {
+	now func() time.Time, lis net.Listener, creds credentials.TransportCredentials) error {
 	if err := applyBootstrap(ctx, s, b, now()); err != nil {
 		return err
 	}
 
 	go reportLoop(ctx, s, window, every, now)
 
-	srv := grpc.NewServer()
+	var opts []grpc.ServerOption
+	if creds != nil {
+		opts = append(opts, grpc.Creds(creds))
+	}
+	srv := grpc.NewServer(opts...)
 	syncpb.RegisterSyncServer(srv, syncrepl.NewServer(s, arbiter.New(s, now)))
 	go func() {
 		<-ctx.Done()

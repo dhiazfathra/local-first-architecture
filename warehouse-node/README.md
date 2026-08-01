@@ -28,15 +28,26 @@ in exceptions, and resolved by a human doing a stock count.
 
 ## Running
 
+The replication stream between a node and central requires mutual TLS by default: the
+node's client certificate is how central authenticates which node a stream belongs to,
+rather than trusting the client-supplied `Hello.node_id` alone.
+
 ```sh
 # central, on Postgres
 go run ./cmd/central -dsn "postgres://user:pass@localhost:5432/warehouse?sslmode=disable" \
-  -listen :9090 -bootstrap bootstrap.json -transit-window 48h
+  -listen :9090 -bootstrap bootstrap.json -transit-window 48h \
+  -tls-cert central.crt -tls-key central.key -tls-client-ca node-ca.crt
 
 # a node, offline-capable; drop -central to run with no network at all
 go run ./cmd/node -db wh-a.db -id wh-a -listen :8080 -central localhost:9090 \
-  -locations RECV-01:receiving,PICK-01:pick,STAGE-01:staging
+  -locations RECV-01:receiving,PICK-01:pick,STAGE-01:staging \
+  -tls-cert wh-a.crt -tls-key wh-a.key -tls-server-ca central-ca.crt
 ```
+
+A node's client certificate Common Name must match its `-id`: central rejects a
+`Hello` whose `node_id` does not match the authenticated peer identity. For local
+development without certificates, pass `-insecure` to both binaries to fall back to
+a plaintext stream with no peer authentication.
 
 `bootstrap.json` seeds the reference data only central owns:
 

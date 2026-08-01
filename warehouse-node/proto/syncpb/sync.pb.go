@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v7.35.1
-// source: proto/sync.proto
+// source: proto/warehouse/sync/v1/sync.proto
 
 package syncpb
 
@@ -33,7 +33,7 @@ type EventID struct {
 
 func (x *EventID) Reset() {
 	*x = EventID{}
-	mi := &file_proto_sync_proto_msgTypes[0]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -45,7 +45,7 @@ func (x *EventID) String() string {
 func (*EventID) ProtoMessage() {}
 
 func (x *EventID) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[0]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -58,7 +58,7 @@ func (x *EventID) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventID.ProtoReflect.Descriptor instead.
 func (*EventID) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{0}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *EventID) GetNodeId() string {
@@ -88,7 +88,7 @@ type HLC struct {
 
 func (x *HLC) Reset() {
 	*x = HLC{}
-	mi := &file_proto_sync_proto_msgTypes[1]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -100,7 +100,7 @@ func (x *HLC) String() string {
 func (*HLC) ProtoMessage() {}
 
 func (x *HLC) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[1]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -113,7 +113,7 @@ func (x *HLC) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HLC.ProtoReflect.Descriptor instead.
 func (*HLC) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{1}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *HLC) GetWall() int64 {
@@ -154,7 +154,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_proto_sync_proto_msgTypes[2]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -166,7 +166,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[2]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -179,7 +179,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{2}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Event) GetId() *EventID {
@@ -246,7 +246,7 @@ type EventBatch struct {
 
 func (x *EventBatch) Reset() {
 	*x = EventBatch{}
-	mi := &file_proto_sync_proto_msgTypes[3]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -258,7 +258,7 @@ func (x *EventBatch) String() string {
 func (*EventBatch) ProtoMessage() {}
 
 func (x *EventBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[3]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -271,7 +271,7 @@ func (x *EventBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventBatch.ProtoReflect.Descriptor instead.
 func (*EventBatch) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{3}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *EventBatch) GetEvents() []*Event {
@@ -295,12 +295,11 @@ func (x *EventBatch) GetLastOrd() uint64 {
 	return 0
 }
 
-// Hello opens a session. version_vector is the highest sequence the node holds per
-// originating node, so central can tell what it still needs to send.
+// Hello opens a session. Field 2 (version_vector) is unused: central answers Hello
+// using only pulled_cursor/known_seq, so no client ever needs to populate it.
 type Hello struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	VersionVector map[string]uint64      `protobuf:"bytes,2,rep,name=version_vector,json=versionVector,proto3" json:"version_vector,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
 	PulledCursor  uint64                 `protobuf:"varint,3,opt,name=pulled_cursor,json=pulledCursor,proto3" json:"pulled_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -308,7 +307,7 @@ type Hello struct {
 
 func (x *Hello) Reset() {
 	*x = Hello{}
-	mi := &file_proto_sync_proto_msgTypes[4]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -320,7 +319,7 @@ func (x *Hello) String() string {
 func (*Hello) ProtoMessage() {}
 
 func (x *Hello) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[4]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -333,7 +332,7 @@ func (x *Hello) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Hello.ProtoReflect.Descriptor instead.
 func (*Hello) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{4}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Hello) GetNodeId() string {
@@ -341,13 +340,6 @@ func (x *Hello) GetNodeId() string {
 		return x.NodeId
 	}
 	return ""
-}
-
-func (x *Hello) GetVersionVector() map[string]uint64 {
-	if x != nil {
-		return x.VersionVector
-	}
-	return nil
 }
 
 func (x *Hello) GetPulledCursor() uint64 {
@@ -368,7 +360,7 @@ type Welcome struct {
 
 func (x *Welcome) Reset() {
 	*x = Welcome{}
-	mi := &file_proto_sync_proto_msgTypes[5]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -380,7 +372,7 @@ func (x *Welcome) String() string {
 func (*Welcome) ProtoMessage() {}
 
 func (x *Welcome) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[5]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -393,7 +385,7 @@ func (x *Welcome) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Welcome.ProtoReflect.Descriptor instead.
 func (*Welcome) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{5}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Welcome) GetKnownSeq() uint64 {
@@ -415,7 +407,7 @@ type Ack struct {
 
 func (x *Ack) Reset() {
 	*x = Ack{}
-	mi := &file_proto_sync_proto_msgTypes[6]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -427,7 +419,7 @@ func (x *Ack) String() string {
 func (*Ack) ProtoMessage() {}
 
 func (x *Ack) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[6]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -440,7 +432,7 @@ func (x *Ack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ack.ProtoReflect.Descriptor instead.
 func (*Ack) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{6}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Ack) GetSeq() uint64 {
@@ -471,7 +463,7 @@ type NodeFrame struct {
 
 func (x *NodeFrame) Reset() {
 	*x = NodeFrame{}
-	mi := &file_proto_sync_proto_msgTypes[7]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -483,7 +475,7 @@ func (x *NodeFrame) String() string {
 func (*NodeFrame) ProtoMessage() {}
 
 func (x *NodeFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[7]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -496,7 +488,7 @@ func (x *NodeFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeFrame.ProtoReflect.Descriptor instead.
 func (*NodeFrame) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{7}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *NodeFrame) GetBody() isNodeFrame_Body {
@@ -569,7 +561,7 @@ type CentralFrame struct {
 
 func (x *CentralFrame) Reset() {
 	*x = CentralFrame{}
-	mi := &file_proto_sync_proto_msgTypes[8]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -581,7 +573,7 @@ func (x *CentralFrame) String() string {
 func (*CentralFrame) ProtoMessage() {}
 
 func (x *CentralFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sync_proto_msgTypes[8]
+	mi := &file_proto_warehouse_sync_v1_sync_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -594,7 +586,7 @@ func (x *CentralFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CentralFrame.ProtoReflect.Descriptor instead.
 func (*CentralFrame) Descriptor() ([]byte, []int) {
-	return file_proto_sync_proto_rawDescGZIP(), []int{8}
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *CentralFrame) GetBody() isCentralFrame_Body {
@@ -653,11 +645,11 @@ func (*CentralFrame_Events) isCentralFrame_Body() {}
 
 func (*CentralFrame_Ack) isCentralFrame_Body() {}
 
-var File_proto_sync_proto protoreflect.FileDescriptor
+var File_proto_warehouse_sync_v1_sync_proto protoreflect.FileDescriptor
 
-const file_proto_sync_proto_rawDesc = "" +
+const file_proto_warehouse_sync_v1_sync_proto_rawDesc = "" +
 	"\n" +
-	"\x10proto/sync.proto\x12\x11warehouse.sync.v1\"4\n" +
+	"\"proto/warehouse/sync/v1/sync.proto\x12\x11warehouse.sync.v1\"4\n" +
 	"\aEventID\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\"G\n" +
@@ -677,14 +669,10 @@ const file_proto_sync_proto_rawDesc = "" +
 	"EventBatch\x120\n" +
 	"\x06events\x18\x01 \x03(\v2\x18.warehouse.sync.v1.EventR\x06events\x12\x12\n" +
 	"\x04more\x18\x02 \x01(\bR\x04more\x12\x19\n" +
-	"\blast_ord\x18\x03 \x01(\x04R\alastOrd\"\xdb\x01\n" +
+	"\blast_ord\x18\x03 \x01(\x04R\alastOrd\"[\n" +
 	"\x05Hello\x12\x17\n" +
-	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12R\n" +
-	"\x0eversion_vector\x18\x02 \x03(\v2+.warehouse.sync.v1.Hello.VersionVectorEntryR\rversionVector\x12#\n" +
-	"\rpulled_cursor\x18\x03 \x01(\x04R\fpulledCursor\x1a@\n" +
-	"\x12VersionVectorEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"&\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12#\n" +
+	"\rpulled_cursor\x18\x03 \x01(\x04R\fpulledCursorJ\x04\b\x02\x10\x03R\x0eversion_vector\"&\n" +
 	"\aWelcome\x12\x1b\n" +
 	"\tknown_seq\x18\x01 \x01(\x04R\bknownSeq\")\n" +
 	"\x03Ack\x12\x10\n" +
@@ -704,19 +692,19 @@ const file_proto_sync_proto_rawDesc = "" +
 	"\tReplicate\x12\x1c.warehouse.sync.v1.NodeFrame\x1a\x1f.warehouse.sync.v1.CentralFrame(\x010\x01BTZRgithub.com/dhiazfathra/local-first-architecture/warehouse-node/proto/syncpb;syncpbb\x06proto3"
 
 var (
-	file_proto_sync_proto_rawDescOnce sync.Once
-	file_proto_sync_proto_rawDescData []byte
+	file_proto_warehouse_sync_v1_sync_proto_rawDescOnce sync.Once
+	file_proto_warehouse_sync_v1_sync_proto_rawDescData []byte
 )
 
-func file_proto_sync_proto_rawDescGZIP() []byte {
-	file_proto_sync_proto_rawDescOnce.Do(func() {
-		file_proto_sync_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_sync_proto_rawDesc), len(file_proto_sync_proto_rawDesc)))
+func file_proto_warehouse_sync_v1_sync_proto_rawDescGZIP() []byte {
+	file_proto_warehouse_sync_v1_sync_proto_rawDescOnce.Do(func() {
+		file_proto_warehouse_sync_v1_sync_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_warehouse_sync_v1_sync_proto_rawDesc), len(file_proto_warehouse_sync_v1_sync_proto_rawDesc)))
 	})
-	return file_proto_sync_proto_rawDescData
+	return file_proto_warehouse_sync_v1_sync_proto_rawDescData
 }
 
-var file_proto_sync_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
-var file_proto_sync_proto_goTypes = []any{
+var file_proto_warehouse_sync_v1_sync_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_proto_warehouse_sync_v1_sync_proto_goTypes = []any{
 	(*EventID)(nil),      // 0: warehouse.sync.v1.EventID
 	(*HLC)(nil),          // 1: warehouse.sync.v1.HLC
 	(*Event)(nil),        // 2: warehouse.sync.v1.Event
@@ -726,40 +714,38 @@ var file_proto_sync_proto_goTypes = []any{
 	(*Ack)(nil),          // 6: warehouse.sync.v1.Ack
 	(*NodeFrame)(nil),    // 7: warehouse.sync.v1.NodeFrame
 	(*CentralFrame)(nil), // 8: warehouse.sync.v1.CentralFrame
-	nil,                  // 9: warehouse.sync.v1.Hello.VersionVectorEntry
 }
-var file_proto_sync_proto_depIdxs = []int32{
+var file_proto_warehouse_sync_v1_sync_proto_depIdxs = []int32{
 	0,  // 0: warehouse.sync.v1.Event.id:type_name -> warehouse.sync.v1.EventID
 	1,  // 1: warehouse.sync.v1.Event.hlc:type_name -> warehouse.sync.v1.HLC
 	0,  // 2: warehouse.sync.v1.Event.causation_id:type_name -> warehouse.sync.v1.EventID
 	2,  // 3: warehouse.sync.v1.EventBatch.events:type_name -> warehouse.sync.v1.Event
-	9,  // 4: warehouse.sync.v1.Hello.version_vector:type_name -> warehouse.sync.v1.Hello.VersionVectorEntry
-	4,  // 5: warehouse.sync.v1.NodeFrame.hello:type_name -> warehouse.sync.v1.Hello
-	3,  // 6: warehouse.sync.v1.NodeFrame.events:type_name -> warehouse.sync.v1.EventBatch
-	6,  // 7: warehouse.sync.v1.NodeFrame.ack:type_name -> warehouse.sync.v1.Ack
-	5,  // 8: warehouse.sync.v1.CentralFrame.welcome:type_name -> warehouse.sync.v1.Welcome
-	3,  // 9: warehouse.sync.v1.CentralFrame.events:type_name -> warehouse.sync.v1.EventBatch
-	6,  // 10: warehouse.sync.v1.CentralFrame.ack:type_name -> warehouse.sync.v1.Ack
-	7,  // 11: warehouse.sync.v1.Sync.Replicate:input_type -> warehouse.sync.v1.NodeFrame
-	8,  // 12: warehouse.sync.v1.Sync.Replicate:output_type -> warehouse.sync.v1.CentralFrame
-	12, // [12:13] is the sub-list for method output_type
-	11, // [11:12] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	4,  // 4: warehouse.sync.v1.NodeFrame.hello:type_name -> warehouse.sync.v1.Hello
+	3,  // 5: warehouse.sync.v1.NodeFrame.events:type_name -> warehouse.sync.v1.EventBatch
+	6,  // 6: warehouse.sync.v1.NodeFrame.ack:type_name -> warehouse.sync.v1.Ack
+	5,  // 7: warehouse.sync.v1.CentralFrame.welcome:type_name -> warehouse.sync.v1.Welcome
+	3,  // 8: warehouse.sync.v1.CentralFrame.events:type_name -> warehouse.sync.v1.EventBatch
+	6,  // 9: warehouse.sync.v1.CentralFrame.ack:type_name -> warehouse.sync.v1.Ack
+	7,  // 10: warehouse.sync.v1.Sync.Replicate:input_type -> warehouse.sync.v1.NodeFrame
+	8,  // 11: warehouse.sync.v1.Sync.Replicate:output_type -> warehouse.sync.v1.CentralFrame
+	11, // [11:12] is the sub-list for method output_type
+	10, // [10:11] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
-func init() { file_proto_sync_proto_init() }
-func file_proto_sync_proto_init() {
-	if File_proto_sync_proto != nil {
+func init() { file_proto_warehouse_sync_v1_sync_proto_init() }
+func file_proto_warehouse_sync_v1_sync_proto_init() {
+	if File_proto_warehouse_sync_v1_sync_proto != nil {
 		return
 	}
-	file_proto_sync_proto_msgTypes[7].OneofWrappers = []any{
+	file_proto_warehouse_sync_v1_sync_proto_msgTypes[7].OneofWrappers = []any{
 		(*NodeFrame_Hello)(nil),
 		(*NodeFrame_Events)(nil),
 		(*NodeFrame_Ack)(nil),
 	}
-	file_proto_sync_proto_msgTypes[8].OneofWrappers = []any{
+	file_proto_warehouse_sync_v1_sync_proto_msgTypes[8].OneofWrappers = []any{
 		(*CentralFrame_Welcome)(nil),
 		(*CentralFrame_Events)(nil),
 		(*CentralFrame_Ack)(nil),
@@ -768,17 +754,17 @@ func file_proto_sync_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sync_proto_rawDesc), len(file_proto_sync_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_warehouse_sync_v1_sync_proto_rawDesc), len(file_proto_warehouse_sync_v1_sync_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_proto_sync_proto_goTypes,
-		DependencyIndexes: file_proto_sync_proto_depIdxs,
-		MessageInfos:      file_proto_sync_proto_msgTypes,
+		GoTypes:           file_proto_warehouse_sync_v1_sync_proto_goTypes,
+		DependencyIndexes: file_proto_warehouse_sync_v1_sync_proto_depIdxs,
+		MessageInfos:      file_proto_warehouse_sync_v1_sync_proto_msgTypes,
 	}.Build()
-	File_proto_sync_proto = out.File
-	file_proto_sync_proto_goTypes = nil
-	file_proto_sync_proto_depIdxs = nil
+	File_proto_warehouse_sync_v1_sync_proto = out.File
+	file_proto_warehouse_sync_v1_sync_proto_goTypes = nil
+	file_proto_warehouse_sync_v1_sync_proto_depIdxs = nil
 }

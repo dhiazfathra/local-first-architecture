@@ -15,7 +15,7 @@ import (
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/domain"
 )
 
-//go:embed schema.sql
+//go:embed schema.sql migrations.sql
 var schemaFS embed.FS
 
 // Postgres is the deployment Store. It passes the same contract test as Memory.
@@ -47,6 +47,17 @@ func OpenPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 	if _, err := pool.Exec(ctx, string(schema)); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	// migrations.sql runs as its own Exec, outside schema.sql's implicit transaction
+	// block: CREATE INDEX CONCURRENTLY cannot run inside a transaction.
+	migrations, err := schemaFS.ReadFile("migrations.sql")
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("read migrations: %w", err)
+	}
+	if _, err := pool.Exec(ctx, string(migrations)); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("apply migrations: %w", err)
 	}
 	p := &Postgres{pool: pool}
 	if err := p.recoverCentral(ctx); err != nil {
@@ -127,6 +138,19 @@ func (p *Postgres) Events(ctx context.Context) ([]domain.Envelope, error) {
 		FROM events ORDER BY hlc_wall, hlc_counter, hlc_node, seq`)
 	if err != nil {
 		return nil, fmt.Errorf("query events: %w", err)
+	}
+	return scanEnvelopes(rows)
+}
+
+// CompensationsOf returns the events already emitted with causation pointing at id,
+// backed by the events_causation index rather than the full-log scan Events does.
+func (p *Postgres) CompensationsOf(ctx context.Context, id domain.EventID) ([]domain.Envelope, error) {
+	rows, err := p.pool.Query(ctx, `SELECT node_id, seq, aggregate_id, type, hlc_wall, hlc_counter,
+		hlc_node, recorded_at, causation_node, causation_seq, payload
+		FROM events WHERE causation_node = $1 AND causation_seq = $2
+		ORDER BY hlc_wall, hlc_counter, hlc_node, seq`, string(id.NodeID), id.Seq)
+	if err != nil {
+		return nil, fmt.Errorf("query compensations of %s: %w", id, err)
 	}
 	return scanEnvelopes(rows)
 }

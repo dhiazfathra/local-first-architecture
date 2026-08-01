@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/domain"
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/node"
@@ -178,7 +179,7 @@ func (a *NodeAPI) Exceptions(_ context.Context, _ *nodeapi.ExceptionsRequest) (*
 	for _, row := range rows {
 		out = append(out, &nodeapi.ExceptionRow{Id: row.ID, Kind: string(row.Kind), Reason: row.Reason,
 			CausedBy: row.CausedBy, Sku: row.Key.SKU, Location: string(row.Key.Location), LotId: row.Key.LotID,
-			Qty: row.Qty, RecordedAt: row.RecordedAt.UTC().Format(time.RFC3339Nano), Resolved: row.Resolved})
+			Qty: row.Qty, RecordedAt: timestamppb.New(row.RecordedAt.UTC()), Resolved: row.Resolved})
 	}
 	return &nodeapi.ExceptionsResponse{Rows: out}, nil
 }
@@ -191,12 +192,12 @@ func (a *NodeAPI) Transfers(_ context.Context, _ *nodeapi.TransfersRequest) (*no
 	}
 	out := make([]*nodeapi.TransferRow, 0, len(rows))
 	for _, row := range rows {
-		at := ""
+		var dispatchedAt *timestamppb.Timestamp
 		if !row.DispatchedAt.IsZero() {
-			at = row.DispatchedAt.UTC().Format(time.RFC3339Nano)
+			dispatchedAt = timestamppb.New(row.DispatchedAt.UTC())
 		}
 		out = append(out, &nodeapi.TransferRow{Id: row.ID, FromNode: string(row.FromNode), ToNode: string(row.ToNode),
-			Dispatched: row.Dispatched, Received: row.Received, Status: string(row.Status), DispatchedAt: at})
+			Dispatched: row.Dispatched, Received: row.Received, Status: string(row.Status), DispatchedAt: dispatchedAt})
 	}
 	return &nodeapi.TransfersResponse{Rows: out}, nil
 }

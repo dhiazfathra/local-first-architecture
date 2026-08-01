@@ -61,6 +61,13 @@ func (f errFake) Events(ctx context.Context) ([]domain.Envelope, error) {
 	return f.Store.Events(ctx)
 }
 
+func (f errFake) CompensationsOf(ctx context.Context, id domain.EventID) ([]domain.Envelope, error) {
+	if err := f.fail("CompensationsOf"); err != nil {
+		return nil, err
+	}
+	return f.Store.CompensationsOf(ctx, id)
+}
+
 func (f errFake) Item(ctx context.Context, sku string) (domain.Item, bool, error) {
 	if err := f.fail("Item"); err != nil {
 		return domain.Item{}, false, err
@@ -276,7 +283,7 @@ func TestArbitratePropagatesStoreErrors(t *testing.T) {
 			seed: func(t *testing.T, a *Arbiter) { mustArbitrate(t, a, dispatch()) }, event: receipt(6),
 		},
 		{name: "fanOut's Enqueue on an accepted dispatch", method: "Enqueue", failOn: 1, event: dispatch()},
-		{name: "compensation replay check on a fresh rejection", method: "Events", failOn: 1, event: unknownSKUReceipt()},
+		{name: "compensation replay check on a fresh rejection", method: "CompensationsOf", failOn: 1, event: unknownSKUReceipt()},
 		{name: "EmitCentral on rejection", method: "EmitCentral", failOn: 1, event: unknownSKUReceipt()},
 		{name: "Enqueue of the compensation on rejection", method: "Enqueue", failOn: 1, event: unknownSKUReceipt()},
 		{name: "RecordDecision on acceptance", method: "RecordDecision", failOn: 1, event: goodReceipt()},
@@ -303,7 +310,7 @@ func TestArbitratePropagatesStoreErrors(t *testing.T) {
 		bad := unknownSKUReceipt()
 		mustArbitrate(t, New(base, func() time.Time { return at }), bad)
 
-		store := newErrFake(base, "Events", 1)
+		store := newErrFake(base, "CompensationsOf", 1)
 		a := New(store, func() time.Time { return at })
 		if _, _, err := a.Arbitrate(ctx, bad); err == nil {
 			t.Fatal("retried Arbitrate with failing Events: expected an error")

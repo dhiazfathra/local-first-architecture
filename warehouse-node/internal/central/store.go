@@ -86,6 +86,9 @@ type Store interface {
 	// Events returns the whole log in total HLC order, for replay and determinism
 	// checks.
 	Events(ctx context.Context) ([]domain.Envelope, error)
+	// CompensationsOf returns the events already emitted with causation pointing at
+	// id, in HLC order — a targeted lookup for arbiter's retry path, not a full scan.
+	CompensationsOf(ctx context.Context, id domain.EventID) ([]domain.Envelope, error)
 	// EmitCentral seals central's own events — compensations and item-master
 	// updates — assigning central's sequence numbers and HLC readings, and appends
 	// them. causation is non-nil exactly when the events compensate a rejection.

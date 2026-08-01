@@ -1,10 +1,13 @@
 package syncrepl
 
 import (
+	"context"
 	"errors"
 	"io"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/arbiter"
@@ -25,6 +28,22 @@ func NewServer(store central.Store, arb *arbiter.Arbiter) *Server {
 	return &Server{store: store, arb: arb}
 }
 
+// peerNodeID reports the node identity from the stream's authenticated peer
+// certificate, if mTLS supplied one. It returns false when the transport carries no
+// TLS peer info at all — plaintext or a non-mTLS TLS config — in which case there is
+// no authenticated identity to compare Hello.node_id against.
+func peerNodeID(ctx context.Context) (domain.NodeID, bool) {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return "", false
+	}
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok || len(tlsInfo.State.PeerCertificates) == 0 {
+		return "", false
+	}
+	return domain.NodeID(tlsInfo.State.PeerCertificates[0].Subject.CommonName), true
+}
+
 // Replicate runs one session: Hello, Welcome, the node's events upstream, then
 // everything queued downstream, then the node's acknowledgement. Cursors are
 // persisted as it goes, so a session that dies halfway costs nothing but a retry.
@@ -40,6 +59,16 @@ func (s *Server) Replicate(stream syncpb.Sync_ReplicateServer) error {
 		return status.Error(codes.InvalidArgument, "a session must open with Hello naming the node")
 	}
 	node := domain.NodeID(hello.GetNodeId())
+	if authNode, ok := peerNodeID(ctx); ok && authNode != node {
+		// A client certificate is presented (mTLS configured) but names a different
+		// node than Hello claims. Trusting Hello.node_id here would let any holder
+		// of a valid client certificate impersonate another node's stream. Without
+		// mTLS configured there is no authenticated identity to check against, and
+		// this is a no-op — the transport-level gap is closed by requiring mTLS in
+		// deployment, not by this check alone.
+		return status.Error(codes.PermissionDenied,
+			"authenticated peer identity does not match Hello.node_id")
+	}
 
 	known, err := s.store.PushedSeq(ctx, node)
 	if err != nil {

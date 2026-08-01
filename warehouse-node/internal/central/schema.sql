@@ -20,6 +20,11 @@ CREATE TABLE IF NOT EXISTS events_default PARTITION OF events DEFAULT;
 
 CREATE INDEX IF NOT EXISTS events_order ON events (hlc_wall, hlc_counter, hlc_node, seq);
 
+-- Supports compensationsOf's lookup of the events emitted for one causation, so
+-- retrying a rejected event's arbitration need not scan the whole log.
+CREATE INDEX IF NOT EXISTS events_causation ON events (causation_node, causation_seq)
+    WHERE causation_node <> '';
+
 -- Per-node sync cursors: how far central has received from the node, and how far the
 -- node has acknowledged what central sent down. Both are why a week offline resumes.
 CREATE TABLE IF NOT EXISTS cursors (
@@ -100,10 +105,9 @@ CREATE TABLE IF NOT EXISTS in_transit (
     PRIMARY KEY (transfer_id, sku, lot_id)
 );
 
--- Supports OpenTransfers' scan, which otherwise walks every row in a table that
--- grows with every dispatched transfer line.
-CREATE INDEX IF NOT EXISTS in_transit_open ON in_transit (dispatched_at)
-    WHERE failed = false AND dispatched - received > 0;
+-- in_transit_open, the index supporting OpenTransfers' scan, is built CONCURRENTLY
+-- by migrations.sql instead of here: CONCURRENTLY cannot run inside the multi-
+-- statement batch OpenPostgres sends this file as.
 
 -- One row per (event, transfer line) folded into an in-transit balance's received
 -- quantity, keyed by the event that produced it so a retried arbitration cannot

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package warehouse.node.v1;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "github.com/dhiazfathra/local-first-architecture/warehouse-node/proto/nodeapi;nodeapi";
 
 // Line is an operator-entered quantity before unit conversion: the uom may be the
@@ -106,7 +108,7 @@ message ExceptionRow {
   string location = 6;
   string lot_id = 7;
   double qty = 8;
-  string recorded_at = 9;
+  google.protobuf.Timestamp recorded_at = 9;
   bool resolved = 10;
 }
 
@@ -123,7 +125,7 @@ message TransferRow {
   double dispatched = 4;
   double received = 5;
   string status = 6;
-  string dispatched_at = 7;
+  google.protobuf.Timestamp dispatched_at = 7;
 }
 
 message TransfersResponse {

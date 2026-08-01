@@ -41,11 +41,12 @@ message EventBatch {
   uint64 last_ord = 3;
 }
 
-// Hello opens a session. version_vector is the highest sequence the node holds per
-// originating node, so central can tell what it still needs to send.
+// Hello opens a session. Field 2 (version_vector) is unused: central answers Hello
+// using only pulled_cursor/known_seq, so no client ever needs to populate it.
 message Hello {
+  reserved 2;
+  reserved "version_vector";
   string node_id = 1;
-  map<string, uint64> version_vector = 2;
   uint64 pulled_cursor = 3;
 }
 

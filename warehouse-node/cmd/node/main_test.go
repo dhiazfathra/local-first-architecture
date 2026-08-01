@@ -2,7 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -24,6 +31,9 @@ import (
 // operator client for it.
 func startNode(t *testing.T, cfg Config) nodeapi.NodeAPIClient {
 	t.Helper()
+	if cfg.Creds == nil {
+		cfg.Creds = insecure.NewCredentials()
+	}
 	lis := bufconn.Listen(1 << 20)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -213,5 +223,108 @@ func TestMainReportsParseLocationsErrors(t *testing.T) {
 
 	if gotCode != 1 {
 		t.Errorf("exit code = %d, want 1", gotCode)
+	}
+}
+
+// selfSignedCert writes a throwaway self-signed certificate and key PEM pair to dir,
+// suitable as both a client certificate and its own CA in tests.
+func selfSignedCert(t *testing.T, dir, name string) (certPath, keyPath string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: name},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	certPath = filepath.Join(dir, name+".crt")
+	keyPath = filepath.Join(dir, name+".key")
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		t.Fatalf("create %s: %v", certPath, err)
+	}
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		t.Fatalf("encode cert: %v", err)
+	}
+	_ = certOut.Close()
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyOut, err := os.Create(keyPath)
+	if err != nil {
+		t.Fatalf("create %s: %v", keyPath, err)
+	}
+	if err := pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}); err != nil {
+		t.Fatalf("encode key: %v", err)
+	}
+	_ = keyOut.Close()
+	return certPath, keyPath
+}
+
+func TestClientCredentialsInsecureReturnsInsecureCredentials(t *testing.T) {
+	creds, err := clientCredentials("", "", "", true)
+	if err != nil {
+		t.Fatalf("clientCredentials(insecure): %v", err)
+	}
+	if creds == nil {
+		t.Fatal("clientCredentials(insecure): want non-nil credentials")
+	}
+}
+
+func TestClientCredentialsRequiresAllTLSFlagsUnlessInsecure(t *testing.T) {
+	if _, err := clientCredentials("", "", "", false); err == nil {
+		t.Fatal("clientCredentials with no TLS flags: expected an error")
+	}
+}
+
+func TestClientCredentialsRejectsAnUnreadableCertificate(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := clientCredentials(filepath.Join(dir, "missing.crt"), filepath.Join(dir, "missing.key"),
+		filepath.Join(dir, "ca.crt"), false); err == nil {
+		t.Fatal("clientCredentials with a missing certificate: expected an error")
+	}
+}
+
+func TestClientCredentialsRejectsAnUnreadableServerCA(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := selfSignedCert(t, dir, "wh-a")
+	if _, err := clientCredentials(cert, key, filepath.Join(dir, "missing-ca.crt"), false); err == nil {
+		t.Fatal("clientCredentials with a missing server CA: expected an error")
+	}
+}
+
+func TestClientCredentialsRejectsAnUnusableServerCA(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := selfSignedCert(t, dir, "wh-a")
+	badCA := filepath.Join(dir, "bad-ca.crt")
+	if err := os.WriteFile(badCA, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := clientCredentials(cert, key, badCA, false); err == nil {
+		t.Fatal("clientCredentials with an unusable server CA: expected an error")
+	}
+}
+
+func TestClientCredentialsSucceedsWithAValidCertificateAndCA(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := selfSignedCert(t, dir, "wh-a")
+	ca, _ := selfSignedCert(t, dir, "central-ca")
+	creds, err := clientCredentials(cert, key, ca, false)
+	if err != nil {
+		t.Fatalf("clientCredentials: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("clientCredentials: want non-nil credentials")
 	}
 }

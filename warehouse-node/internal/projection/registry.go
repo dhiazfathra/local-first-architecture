@@ -5,6 +5,7 @@ package projection
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/domain"
@@ -205,7 +206,7 @@ func (s *Set) isApplied(node domain.NodeID, seq uint64) (bool, error) {
 	err := s.db.QueryRow(`SELECT 1 FROM projection_applied WHERE node_id = ? AND seq = ?`,
 		string(node), seq).Scan(&one)
 	switch {
-	case err == sql.ErrNoRows:
+	case errors.Is(err, sql.ErrNoRows):
 		return false, nil
 	case err != nil:
 		return false, fmt.Errorf("read applied for %s/%d: %w", node, seq, err)

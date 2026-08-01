@@ -6,8 +6,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -16,6 +19,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/domain"
@@ -35,6 +39,39 @@ type Config struct {
 	SyncEvery time.Duration
 	Backoff   time.Duration
 	Locations map[domain.LocationCode]domain.LocationType
+	// Creds dials Central with. Nil only when the caller opted into -insecure.
+	Creds credentials.TransportCredentials
+}
+
+// clientCredentials builds the credentials Config.Creds dials central with. By
+// default it requires mTLS: a client certificate central can verify, plus the CA
+// that signs central's own server certificate, so a plaintext dial can never
+// silently stand in for an authenticated one. insecureNoTLS opts out for local
+// development, never by default.
+func clientCredentials(certPath, keyPath, serverCAPath string, insecureNoTLS bool) (credentials.TransportCredentials, error) {
+	if insecureNoTLS {
+		log.Print("node: -insecure set, dialing central in plaintext with no server or client authentication")
+		return insecure.NewCredentials(), nil
+	}
+	if certPath == "" || keyPath == "" || serverCAPath == "" {
+		return nil, fmt.Errorf("-tls-cert, -tls-key and -tls-server-ca are required unless -insecure is set")
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load client TLS certificate: %w", err)
+	}
+	caPEM, err := os.ReadFile(serverCAPath)
+	if err != nil {
+		return nil, fmt.Errorf("read server CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("server CA %s contains no usable certificates", serverCAPath)
+	}
+	return credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+	}), nil
 }
 
 // osExit is os.Exit, swappable in tests so main can run to completion
@@ -61,9 +98,20 @@ func realMain() error {
 	fs.StringVar(&locations, "locations", "",
 		"comma-separated code:type pairs to register on startup, e.g. RECV-01:receiving,PICK-01:pick")
 	listen := fs.String("listen", ":8080", "address to serve the operator API on")
+	tlsCert := fs.String("tls-cert", "", "path to this node's TLS client certificate (PEM)")
+	tlsKey := fs.String("tls-key", "", "path to this node's TLS client private key (PEM)")
+	tlsServerCA := fs.String("tls-server-ca", "",
+		"path to the CA (PEM) that signs central's server certificate")
+	insecureNoTLS := fs.Bool("insecure", false,
+		"dial central in plaintext with no server or client authentication; for local development only")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
+	creds, err := clientCredentials(*tlsCert, *tlsKey, *tlsServerCA, *insecureNoTLS)
+	if err != nil {
+		return err
+	}
+	cfg.Creds = creds
 
 	if id == "" {
 		return fmt.Errorf("-id is required")
@@ -116,7 +164,7 @@ func run(ctx context.Context, cfg Config, lis net.Listener) error {
 	}
 
 	if cfg.Central != "" {
-		conn, err := grpc.NewClient(cfg.Central, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.Central, grpc.WithTransportCredentials(cfg.Creds))
 		if err != nil {
 			return fmt.Errorf("dial central at %s: %w", cfg.Central, err)
 		}

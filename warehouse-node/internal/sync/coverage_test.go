@@ -507,12 +507,12 @@ func dropTable(t *testing.T, path, table string) {
 	}
 }
 
-func TestSessionVersionVectorError(t *testing.T) {
+func TestSessionEventsTableMissingError(t *testing.T) {
 	svc, path := startNodeAtPath(t, "wh-a")
 	dropTable(t, path, "events")
 	client := NewClient(svc, &fakeSyncClient{stream: &fakeClientStream{ctx: context.Background()}})
 	if err := client.Session(context.Background()); err == nil {
-		t.Fatal("expected an error: the events table is gone, so VersionVector cannot read it")
+		t.Fatal("expected an error: the events table is gone, so pushBacklog cannot read it")
 	}
 }
 

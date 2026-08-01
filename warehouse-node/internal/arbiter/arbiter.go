@@ -122,10 +122,19 @@ func (a *Arbiter) Arbitrate(ctx context.Context, env domain.Envelope) (central.D
 	if err != nil {
 		return central.Decision{}, nil, err
 	}
-	if len(comps) == 0 {
+	switch {
+	case len(comps) == 0:
 		if comps, err = a.store.EmitCentral(ctx, rejection.Events, &env.ID, a.now()); err != nil {
 			return central.Decision{}, nil, err
 		}
+	case len(comps) != len(rejection.Events):
+		// A crash between EmitCentral's per-event inserts can leave a partial
+		// compensation set in the log. Emitting only the missing remainder is not
+		// possible without per-event identity, so surface the gap instead of
+		// silently treating the partial set as the whole rejection.
+		return central.Decision{}, nil, fmt.Errorf(
+			"compensation set for %s is incomplete: %d of %d events in the log",
+			env.ID, len(comps), len(rejection.Events))
 	}
 	if err := a.store.Enqueue(ctx, env.ID.NodeID, comps); err != nil {
 		return central.Decision{}, nil, err
@@ -139,19 +148,11 @@ func (a *Arbiter) Arbitrate(ctx context.Context, env domain.Envelope) (central.D
 
 // compensationsOf returns the envelopes already emitted with causation pointing at
 // id, for replaying the result of an earlier decision back to a caller that retried
-// Arbitrate. Most decisions have none (accepted) or one (rejected); it is a small
-// filter over the log rather than a dedicated index because retries are the
-// exception, not the hot path.
+// Arbitrate. Backed by the store's targeted causation lookup, not a full-log scan.
 func (a *Arbiter) compensationsOf(ctx context.Context, id domain.EventID) ([]domain.Envelope, error) {
-	all, err := a.store.Events(ctx)
+	comps, err := a.store.CompensationsOf(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("read compensations of %s: %w", id, err)
-	}
-	var comps []domain.Envelope
-	for _, e := range all {
-		if e.CausationID != nil && *e.CausationID == id {
-			comps = append(comps, e)
-		}
 	}
 	return comps, nil
 }

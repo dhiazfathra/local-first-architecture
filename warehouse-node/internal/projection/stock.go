@@ -2,6 +2,7 @@ package projection
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/domain"
@@ -65,7 +66,7 @@ func transferToNode(tx *sql.Tx, id string) (domain.NodeID, error) {
 	var to string
 	err := tx.QueryRow(`SELECT to_node FROM transfers WHERE id = ?`, id).Scan(&to)
 	switch {
-	case err == sql.ErrNoRows:
+	case errors.Is(err, sql.ErrNoRows):
 		return "", nil
 	case err != nil:
 		return "", fmt.Errorf("look up transfer %s destination: %w", id, err)
@@ -134,7 +135,7 @@ func (s *Set) Balance(k domain.StockKey) (float64, error) {
 	err := s.db.QueryRow(`SELECT qty FROM stock_on_hand WHERE sku = ? AND location = ? AND lot_id = ?`,
 		k.SKU, string(k.Location), k.LotID).Scan(&qty)
 	switch {
-	case err == sql.ErrNoRows:
+	case errors.Is(err, sql.ErrNoRows):
 		return 0, nil
 	case err != nil:
 		return 0, fmt.Errorf("read balance at %+v: %w", k, err)

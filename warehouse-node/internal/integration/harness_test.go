@@ -84,11 +84,18 @@ func newCluster(t *testing.T, ordered float64, rejects map[domain.NodeID][]strin
 	}
 
 	stub := c.serve()
+	// One central emission, fanned out to both nodes, as replication would do.
+	master, err := store.EmitCentral(ctx, []domain.Event{
+		{Type: domain.TypeItemUpserted, AggregateID: "WIDGET", Payload: domain.ItemUpserted{Item: widget()}},
+	}, nil, at)
+	if err != nil {
+		t.Fatalf("EmitCentral: %v", err)
+	}
 	for _, id := range []domain.NodeID{"wh-a", "wh-b"} {
 		if err := store.RegisterNode(ctx, id, rejects[id]); err != nil {
 			t.Fatalf("RegisterNode(%s): %v", id, err)
 		}
-		c.nodes[id] = c.startWarehouse(id, stub)
+		c.nodes[id] = c.startWarehouse(id, stub, master)
 	}
 	return c
 }
@@ -120,7 +127,7 @@ func (c *cluster) serve() syncpb.SyncClient {
 
 // startWarehouse opens one node with the standard locations and no item master; the
 // master arrives from central on the first sync, exactly as in deployment.
-func (c *cluster) startWarehouse(id domain.NodeID, stub syncpb.SyncClient) *warehouse {
+func (c *cluster) startWarehouse(id domain.NodeID, stub syncpb.SyncClient, master []domain.Envelope) *warehouse {
 	c.t.Helper()
 	n := 0
 	svc, err := node.Open(filepath.Join(c.t.TempDir(), string(id)+".db"), id, func() time.Time {
@@ -140,15 +147,9 @@ func (c *cluster) startWarehouse(id domain.NodeID, stub syncpb.SyncClient) *ware
 			c.t.Fatalf("RegisterLocation(%s): %v", code, err)
 		}
 	}
-	// Replicate the item master down. In deployment central queues this from its
-	// bootstrap; here the same events are pushed straight into the node's log.
-	envs, err := c.store.EmitCentral(context.Background(), []domain.Event{
-		{Type: domain.TypeItemUpserted, AggregateID: "WIDGET", Payload: domain.ItemUpserted{Item: widget()}},
-	}, nil, at)
-	if err != nil {
-		c.t.Fatalf("EmitCentral: %v", err)
-	}
-	if _, err := svc.Ingest(envs); err != nil {
+	// Replicate the item master down. Central emitted these once; every node
+	// ingests the same envelopes, exactly as replication delivers them.
+	if _, err := svc.Ingest(master); err != nil {
 		c.t.Fatalf("Ingest item master: %v", err)
 	}
 
@@ -225,77 +226,60 @@ func replayFresh(t *testing.T, w *warehouse) *projection.Set {
 	return set
 }
 
+// bothOrDie fetches the same read model from the live node and the replay.
+func bothOrDie[T any](t *testing.T, model string, live, replayed func() ([]T, error)) ([]T, []T) {
+	t.Helper()
+	l, err := live()
+	if err != nil {
+		t.Fatalf("live %s: %v", model, err)
+	}
+	r, err := replayed()
+	if err != nil {
+		t.Fatalf("replayed %s: %v", model, err)
+	}
+	return l, r
+}
+
+// sameRows compares a live read model against its replayed twin.
+func sameRows[T any](t *testing.T, model string, live, replayed []T, eq func(a, b T) bool) {
+	t.Helper()
+	if len(live) != len(replayed) {
+		t.Fatalf("replay produced %d %s rows, want %d", len(replayed), model, len(live))
+	}
+	for i := range live {
+		if !eq(live[i], replayed[i]) {
+			t.Errorf("%s row %d: replay gave %+v, want %+v", model, i, replayed[i], live[i])
+		}
+	}
+}
+
 // assertDeterministic replays a node's log onto empty projections and asserts every
 // read model comes out identical.
 func assertDeterministic(t *testing.T, w *warehouse) {
 	t.Helper()
 	replayed := replayFresh(t, w)
 
-	liveStock, err := w.svc.StockOnHand("", "")
-	if err != nil {
-		t.Fatalf("live StockOnHand: %v", err)
-	}
-	replayedStock, err := replayed.StockOnHand("", "")
-	if err != nil {
-		t.Fatalf("replayed StockOnHand: %v", err)
-	}
-	if len(liveStock) != len(replayedStock) {
-		t.Fatalf("replay produced %d stock rows, want %d", len(replayedStock), len(liveStock))
-	}
-	for i := range liveStock {
-		if liveStock[i] != replayedStock[i] {
-			t.Errorf("stock row %d: replay gave %+v, want %+v", i, replayedStock[i], liveStock[i])
-		}
-	}
+	stockLive, stockReplay := bothOrDie(t, "stock",
+		func() ([]projection.StockRow, error) { return w.svc.StockOnHand("", "") },
+		func() ([]projection.StockRow, error) { return replayed.StockOnHand("", "") })
+	sameRows(t, "stock", stockLive, stockReplay,
+		func(a, b projection.StockRow) bool { return a == b })
 
-	liveRes, err := w.svc.Reservations()
-	if err != nil {
-		t.Fatalf("live Reservations: %v", err)
-	}
-	replayedRes, err := replayed.Reservations()
-	if err != nil {
-		t.Fatalf("replayed Reservations: %v", err)
-	}
-	if len(liveRes) != len(replayedRes) {
-		t.Fatalf("replay produced %d reservations, want %d", len(replayedRes), len(liveRes))
-	}
-	for i := range liveRes {
-		if liveRes[i] != replayedRes[i] {
-			t.Errorf("reservation %d: replay gave %+v, want %+v", i, replayedRes[i], liveRes[i])
-		}
-	}
+	resLive, resReplay := bothOrDie(t, "reservations", w.svc.Reservations, replayed.Reservations)
+	sameRows(t, "reservation", resLive, resReplay,
+		func(a, b projection.ReservationRow) bool { return a == b })
 
-	liveExc, err := w.svc.Exceptions()
-	if err != nil {
-		t.Fatalf("live Exceptions: %v", err)
-	}
-	replayedExc, err := replayed.Exceptions()
-	if err != nil {
-		t.Fatalf("replayed Exceptions: %v", err)
-	}
-	if len(liveExc) != len(replayedExc) {
-		t.Fatalf("replay produced %d exceptions, want %d", len(replayedExc), len(liveExc))
-	}
-	for i := range liveExc {
-		if liveExc[i] != replayedExc[i] {
-			t.Errorf("exception %d: replay gave %+v, want %+v", i, replayedExc[i], liveExc[i])
-		}
-	}
+	excLive, excReplay := bothOrDie(t, "exceptions", w.svc.Exceptions, replayed.Exceptions)
+	sameRows(t, "exception", excLive, excReplay, func(a, b projection.ExceptionRow) bool {
+		return a.ID == b.ID && a.Kind == b.Kind && a.Reason == b.Reason && a.CausedBy == b.CausedBy &&
+			a.Key == b.Key && a.Qty == b.Qty && a.Resolved == b.Resolved &&
+			a.RecordedAt.Equal(b.RecordedAt)
+	})
 
-	liveTr, err := w.svc.Transfers()
-	if err != nil {
-		t.Fatalf("live Transfers: %v", err)
-	}
-	replayedTr, err := replayed.Transfers()
-	if err != nil {
-		t.Fatalf("replayed Transfers: %v", err)
-	}
-	if len(liveTr) != len(replayedTr) {
-		t.Fatalf("replay produced %d transfers, want %d", len(replayedTr), len(liveTr))
-	}
-	for i := range liveTr {
-		if liveTr[i] != replayedTr[i] {
-			t.Errorf("transfer %d: replay gave %+v, want %+v", i, replayedTr[i], liveTr[i])
-		}
-	}
+	trLive, trReplay := bothOrDie(t, "transfers", w.svc.Transfers, replayed.Transfers)
+	sameRows(t, "transfer", trLive, trReplay, func(a, b projection.TransferRow) bool {
+		return a.ID == b.ID && a.FromNode == b.FromNode && a.ToNode == b.ToNode &&
+			a.Dispatched == b.Dispatched && a.Received == b.Received && a.Status == b.Status &&
+			a.DispatchedAt.Equal(b.DispatchedAt)
+	})
 }

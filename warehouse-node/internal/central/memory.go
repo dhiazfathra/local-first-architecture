@@ -100,6 +100,20 @@ func (m *Memory) Events(_ context.Context) ([]domain.Envelope, error) {
 	return m.sortedEvents(), nil
 }
 
+// CompensationsOf returns the events already emitted with causation pointing at id,
+// in HLC order.
+func (m *Memory) CompensationsOf(_ context.Context, id domain.EventID) ([]domain.Envelope, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var comps []domain.Envelope
+	for _, env := range m.sortedEvents() {
+		if env.CausationID != nil && *env.CausationID == id {
+			comps = append(comps, env)
+		}
+	}
+	return comps, nil
+}
+
 func (m *Memory) sortedEvents() []domain.Envelope {
 	out := make([]domain.Envelope, 0, len(m.events))
 	for _, env := range m.events {

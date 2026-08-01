@@ -113,6 +113,10 @@ type State struct {
 	Items     map[string]Item
 	Locations map[LocationCode]LocationType
 	Lots      map[string]Lot
+	// lotsBySKU indexes Lots by SKU so backfillLotExpiry need not scan every lot
+	// in the node's population on each ItemUpserted. Kept in sync by registerLot,
+	// the only place a lot is added.
+	lotsBySKU map[string][]string
 	// Stock may hold negative values: a compensation from central can drive a
 	// location negative after the node has already shipped the goods. That is
 	// recorded and flagged, never clamped.
@@ -163,6 +167,7 @@ func NewState() *State {
 		Items:           map[string]Item{},
 		Locations:       map[LocationCode]LocationType{},
 		Lots:            map[string]Lot{},
+		lotsBySKU:       map[string][]string{},
 		Stock:           map[StockKey]float64{},
 		Reservations:    map[string]Reservation{},
 		Receipts:        map[string]*ReceiptState{},
@@ -395,6 +400,7 @@ func (s *State) registerLot(m Movement, at time.Time) {
 		lot.ExpiresOn = lot.ReceivedAt.AddDate(0, 0, it.ShelfLifeDays)
 	}
 	s.Lots[m.LotID] = lot
+	s.lotsBySKU[m.SKU] = append(s.lotsBySKU[m.SKU], m.LotID)
 }
 
 // backfillLotExpiry dates expiry, from its own recorded receipt instant, for
@@ -408,8 +414,9 @@ func (s *State) backfillLotExpiry(item Item) {
 	if item.ShelfLifeDays <= 0 {
 		return
 	}
-	for id, lot := range s.Lots {
-		if lot.SKU == item.SKU && lot.ExpiresOn.IsZero() {
+	for _, id := range s.lotsBySKU[item.SKU] {
+		lot := s.Lots[id]
+		if lot.ExpiresOn.IsZero() {
 			lot.ExpiresOn = lot.ReceivedAt.AddDate(0, 0, item.ShelfLifeDays)
 			s.Lots[id] = lot
 		}

@@ -9,6 +9,7 @@ package nodeapi
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -933,7 +934,7 @@ type ExceptionRow struct {
 	Location      string                 `protobuf:"bytes,6,opt,name=location,proto3" json:"location,omitempty"`
 	LotId         string                 `protobuf:"bytes,7,opt,name=lot_id,json=lotId,proto3" json:"lot_id,omitempty"`
 	Qty           float64                `protobuf:"fixed64,8,opt,name=qty,proto3" json:"qty,omitempty"`
-	RecordedAt    string                 `protobuf:"bytes,9,opt,name=recorded_at,json=recordedAt,proto3" json:"recorded_at,omitempty"`
+	RecordedAt    *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=recorded_at,json=recordedAt,proto3" json:"recorded_at,omitempty"`
 	Resolved      bool                   `protobuf:"varint,10,opt,name=resolved,proto3" json:"resolved,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1025,11 +1026,11 @@ func (x *ExceptionRow) GetQty() float64 {
 	return 0
 }
 
-func (x *ExceptionRow) GetRecordedAt() string {
+func (x *ExceptionRow) GetRecordedAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.RecordedAt
 	}
-	return ""
+	return nil
 }
 
 func (x *ExceptionRow) GetResolved() bool {
@@ -1127,7 +1128,7 @@ type TransferRow struct {
 	Dispatched    float64                `protobuf:"fixed64,4,opt,name=dispatched,proto3" json:"dispatched,omitempty"`
 	Received      float64                `protobuf:"fixed64,5,opt,name=received,proto3" json:"received,omitempty"`
 	Status        string                 `protobuf:"bytes,6,opt,name=status,proto3" json:"status,omitempty"`
-	DispatchedAt  string                 `protobuf:"bytes,7,opt,name=dispatched_at,json=dispatchedAt,proto3" json:"dispatched_at,omitempty"`
+	DispatchedAt  *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=dispatched_at,json=dispatchedAt,proto3" json:"dispatched_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1204,11 +1205,11 @@ func (x *TransferRow) GetStatus() string {
 	return ""
 }
 
-func (x *TransferRow) GetDispatchedAt() string {
+func (x *TransferRow) GetDispatchedAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.DispatchedAt
 	}
-	return ""
+	return nil
 }
 
 type TransfersResponse struct {
@@ -1259,7 +1260,7 @@ var File_proto_node_api_proto protoreflect.FileDescriptor
 
 const file_proto_node_api_proto_rawDesc = "" +
 	"\n" +
-	"\x14proto/node_api.proto\x12\x11warehouse.node.v1\"S\n" +
+	"\x14proto/node_api.proto\x12\x11warehouse.node.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"S\n" +
 	"\x04Line\x12\x10\n" +
 	"\x03sku\x18\x01 \x01(\tR\x03sku\x12\x15\n" +
 	"\x06lot_id\x18\x02 \x01(\tR\x05lotId\x12\x10\n" +
@@ -1318,7 +1319,7 @@ const file_proto_node_api_proto_rawDesc = "" +
 	"\tavailable\x18\x05 \x01(\x01R\tavailable\"F\n" +
 	"\x13StockOnHandResponse\x12/\n" +
 	"\x04rows\x18\x01 \x03(\v2\x1b.warehouse.node.v1.StockRowR\x04rows\"\x13\n" +
-	"\x11ExceptionsRequest\"\xfb\x01\n" +
+	"\x11ExceptionsRequest\"\x97\x02\n" +
 	"\fExceptionRow\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x16\n" +
@@ -1327,14 +1328,14 @@ const file_proto_node_api_proto_rawDesc = "" +
 	"\x03sku\x18\x05 \x01(\tR\x03sku\x12\x1a\n" +
 	"\blocation\x18\x06 \x01(\tR\blocation\x12\x15\n" +
 	"\x06lot_id\x18\a \x01(\tR\x05lotId\x12\x10\n" +
-	"\x03qty\x18\b \x01(\x01R\x03qty\x12\x1f\n" +
-	"\vrecorded_at\x18\t \x01(\tR\n" +
+	"\x03qty\x18\b \x01(\x01R\x03qty\x12;\n" +
+	"\vrecorded_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"recordedAt\x12\x1a\n" +
 	"\bresolved\x18\n" +
 	" \x01(\bR\bresolved\"I\n" +
 	"\x12ExceptionsResponse\x123\n" +
 	"\x04rows\x18\x01 \x03(\v2\x1f.warehouse.node.v1.ExceptionRowR\x04rows\"\x12\n" +
-	"\x10TransfersRequest\"\xcc\x01\n" +
+	"\x10TransfersRequest\"\xe8\x01\n" +
 	"\vTransferRow\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1b\n" +
 	"\tfrom_node\x18\x02 \x01(\tR\bfromNode\x12\x17\n" +
@@ -1343,8 +1344,8 @@ const file_proto_node_api_proto_rawDesc = "" +
 	"dispatched\x18\x04 \x01(\x01R\n" +
 	"dispatched\x12\x1a\n" +
 	"\breceived\x18\x05 \x01(\x01R\breceived\x12\x16\n" +
-	"\x06status\x18\x06 \x01(\tR\x06status\x12#\n" +
-	"\rdispatched_at\x18\a \x01(\tR\fdispatchedAt\"G\n" +
+	"\x06status\x18\x06 \x01(\tR\x06status\x12?\n" +
+	"\rdispatched_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\fdispatchedAt\"G\n" +
 	"\x11TransfersResponse\x122\n" +
 	"\x04rows\x18\x01 \x03(\v2\x1e.warehouse.node.v1.TransferRowR\x04rows2\x90\t\n" +
 	"\aNodeAPI\x12P\n" +
@@ -1400,6 +1401,7 @@ var file_proto_node_api_proto_goTypes = []any{
 	(*TransfersRequest)(nil),          // 18: warehouse.node.v1.TransfersRequest
 	(*TransferRow)(nil),               // 19: warehouse.node.v1.TransferRow
 	(*TransfersResponse)(nil),         // 20: warehouse.node.v1.TransfersResponse
+	(*timestamppb.Timestamp)(nil),     // 21: google.protobuf.Timestamp
 }
 var file_proto_node_api_proto_depIdxs = []int32{
 	0,  // 0: warehouse.node.v1.ReceiveRequest.line:type_name -> warehouse.node.v1.Line
@@ -1410,39 +1412,41 @@ var file_proto_node_api_proto_depIdxs = []int32{
 	0,  // 5: warehouse.node.v1.DispatchTransferRequest.lines:type_name -> warehouse.node.v1.Line
 	0,  // 6: warehouse.node.v1.ReceiveTransferRequest.lines:type_name -> warehouse.node.v1.Line
 	13, // 7: warehouse.node.v1.StockOnHandResponse.rows:type_name -> warehouse.node.v1.StockRow
-	16, // 8: warehouse.node.v1.ExceptionsResponse.rows:type_name -> warehouse.node.v1.ExceptionRow
-	19, // 9: warehouse.node.v1.TransfersResponse.rows:type_name -> warehouse.node.v1.TransferRow
-	2,  // 10: warehouse.node.v1.NodeAPI.Receive:input_type -> warehouse.node.v1.ReceiveRequest
-	3,  // 11: warehouse.node.v1.NodeAPI.PutAway:input_type -> warehouse.node.v1.PutAwayRequest
-	4,  // 12: warehouse.node.v1.NodeAPI.Pick:input_type -> warehouse.node.v1.PickRequest
-	5,  // 13: warehouse.node.v1.NodeAPI.Reserve:input_type -> warehouse.node.v1.ReserveRequest
-	6,  // 14: warehouse.node.v1.NodeAPI.ReleaseReservation:input_type -> warehouse.node.v1.ReleaseReservationRequest
-	7,  // 15: warehouse.node.v1.NodeAPI.StartCount:input_type -> warehouse.node.v1.StartCountRequest
-	8,  // 16: warehouse.node.v1.NodeAPI.CountLine:input_type -> warehouse.node.v1.CountLineRequest
-	9,  // 17: warehouse.node.v1.NodeAPI.CloseCount:input_type -> warehouse.node.v1.CloseCountRequest
-	10, // 18: warehouse.node.v1.NodeAPI.DispatchTransfer:input_type -> warehouse.node.v1.DispatchTransferRequest
-	11, // 19: warehouse.node.v1.NodeAPI.ReceiveTransfer:input_type -> warehouse.node.v1.ReceiveTransferRequest
-	12, // 20: warehouse.node.v1.NodeAPI.StockOnHand:input_type -> warehouse.node.v1.StockOnHandRequest
-	15, // 21: warehouse.node.v1.NodeAPI.Exceptions:input_type -> warehouse.node.v1.ExceptionsRequest
-	18, // 22: warehouse.node.v1.NodeAPI.Transfers:input_type -> warehouse.node.v1.TransfersRequest
-	1,  // 23: warehouse.node.v1.NodeAPI.Receive:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 24: warehouse.node.v1.NodeAPI.PutAway:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 25: warehouse.node.v1.NodeAPI.Pick:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 26: warehouse.node.v1.NodeAPI.Reserve:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 27: warehouse.node.v1.NodeAPI.ReleaseReservation:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 28: warehouse.node.v1.NodeAPI.StartCount:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 29: warehouse.node.v1.NodeAPI.CountLine:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 30: warehouse.node.v1.NodeAPI.CloseCount:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 31: warehouse.node.v1.NodeAPI.DispatchTransfer:output_type -> warehouse.node.v1.CommandResponse
-	1,  // 32: warehouse.node.v1.NodeAPI.ReceiveTransfer:output_type -> warehouse.node.v1.CommandResponse
-	14, // 33: warehouse.node.v1.NodeAPI.StockOnHand:output_type -> warehouse.node.v1.StockOnHandResponse
-	17, // 34: warehouse.node.v1.NodeAPI.Exceptions:output_type -> warehouse.node.v1.ExceptionsResponse
-	20, // 35: warehouse.node.v1.NodeAPI.Transfers:output_type -> warehouse.node.v1.TransfersResponse
-	23, // [23:36] is the sub-list for method output_type
-	10, // [10:23] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	21, // 8: warehouse.node.v1.ExceptionRow.recorded_at:type_name -> google.protobuf.Timestamp
+	16, // 9: warehouse.node.v1.ExceptionsResponse.rows:type_name -> warehouse.node.v1.ExceptionRow
+	21, // 10: warehouse.node.v1.TransferRow.dispatched_at:type_name -> google.protobuf.Timestamp
+	19, // 11: warehouse.node.v1.TransfersResponse.rows:type_name -> warehouse.node.v1.TransferRow
+	2,  // 12: warehouse.node.v1.NodeAPI.Receive:input_type -> warehouse.node.v1.ReceiveRequest
+	3,  // 13: warehouse.node.v1.NodeAPI.PutAway:input_type -> warehouse.node.v1.PutAwayRequest
+	4,  // 14: warehouse.node.v1.NodeAPI.Pick:input_type -> warehouse.node.v1.PickRequest
+	5,  // 15: warehouse.node.v1.NodeAPI.Reserve:input_type -> warehouse.node.v1.ReserveRequest
+	6,  // 16: warehouse.node.v1.NodeAPI.ReleaseReservation:input_type -> warehouse.node.v1.ReleaseReservationRequest
+	7,  // 17: warehouse.node.v1.NodeAPI.StartCount:input_type -> warehouse.node.v1.StartCountRequest
+	8,  // 18: warehouse.node.v1.NodeAPI.CountLine:input_type -> warehouse.node.v1.CountLineRequest
+	9,  // 19: warehouse.node.v1.NodeAPI.CloseCount:input_type -> warehouse.node.v1.CloseCountRequest
+	10, // 20: warehouse.node.v1.NodeAPI.DispatchTransfer:input_type -> warehouse.node.v1.DispatchTransferRequest
+	11, // 21: warehouse.node.v1.NodeAPI.ReceiveTransfer:input_type -> warehouse.node.v1.ReceiveTransferRequest
+	12, // 22: warehouse.node.v1.NodeAPI.StockOnHand:input_type -> warehouse.node.v1.StockOnHandRequest
+	15, // 23: warehouse.node.v1.NodeAPI.Exceptions:input_type -> warehouse.node.v1.ExceptionsRequest
+	18, // 24: warehouse.node.v1.NodeAPI.Transfers:input_type -> warehouse.node.v1.TransfersRequest
+	1,  // 25: warehouse.node.v1.NodeAPI.Receive:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 26: warehouse.node.v1.NodeAPI.PutAway:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 27: warehouse.node.v1.NodeAPI.Pick:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 28: warehouse.node.v1.NodeAPI.Reserve:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 29: warehouse.node.v1.NodeAPI.ReleaseReservation:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 30: warehouse.node.v1.NodeAPI.StartCount:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 31: warehouse.node.v1.NodeAPI.CountLine:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 32: warehouse.node.v1.NodeAPI.CloseCount:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 33: warehouse.node.v1.NodeAPI.DispatchTransfer:output_type -> warehouse.node.v1.CommandResponse
+	1,  // 34: warehouse.node.v1.NodeAPI.ReceiveTransfer:output_type -> warehouse.node.v1.CommandResponse
+	14, // 35: warehouse.node.v1.NodeAPI.StockOnHand:output_type -> warehouse.node.v1.StockOnHandResponse
+	17, // 36: warehouse.node.v1.NodeAPI.Exceptions:output_type -> warehouse.node.v1.ExceptionsResponse
+	20, // 37: warehouse.node.v1.NodeAPI.Transfers:output_type -> warehouse.node.v1.TransfersResponse
+	25, // [25:38] is the sub-list for method output_type
+	12, // [12:25] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_proto_node_api_proto_init() }

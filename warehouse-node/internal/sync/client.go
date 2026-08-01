@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"time"
 
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/domain"
@@ -12,6 +13,10 @@ import (
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/internal/node"
 	"github.com/dhiazfathra/local-first-architecture/warehouse-node/proto/syncpb"
 )
+
+// maxBackoff caps Run's reconnect wait once every doubling has topped out, so an
+// extended central outage never leaves a node waiting hours to retry.
+const maxBackoff = 5 * time.Minute
 
 // Client is the node's side of the replication stream. The transport is injected as a
 // syncpb.SyncClient, so tests drive a real gRPC stream over an in-process listener.
@@ -27,15 +32,23 @@ func NewClient(svc *node.Service, remote syncpb.SyncClient) *Client {
 
 // Run keeps syncing until ctx is done. A failed session is not an error the operator
 // sees: central being unreachable is a normal state for a warehouse, so the failure is
-// logged by the caller at most and retried after backoff.
+// logged by the caller at most and retried after backoff. The backoff grows and jitters
+// on repeated failure so nodes reconnecting after a shared outage do not all retry on
+// the same tick, and resets once a session succeeds.
 func (c *Client) Run(ctx context.Context, every, backoff time.Duration) error {
+	current := backoff
 	for {
 		wait := every
 		if err := c.Session(ctx); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			wait = backoff
+			wait = current + rand.N(current/2+1)
+			if current < maxBackoff {
+				current *= 2
+			}
+		} else {
+			current = backoff
 		}
 		select {
 		case <-ctx.Done():
@@ -54,19 +67,11 @@ func (c *Client) Session(ctx context.Context) error {
 		return fmt.Errorf("open replication stream: %w", err)
 	}
 
-	vector, err := c.svc.Log().VersionVector()
-	if err != nil {
-		return err
-	}
 	pulled, err := c.svc.Log().Cursor(eventlog.CursorPulled)
 	if err != nil {
 		return err
 	}
-	hello := &syncpb.Hello{NodeId: string(c.svc.NodeID()), PulledCursor: pulled,
-		VersionVector: map[string]uint64{}}
-	for id, seq := range vector {
-		hello.VersionVector[string(id)] = seq
-	}
+	hello := &syncpb.Hello{NodeId: string(c.svc.NodeID()), PulledCursor: pulled}
 	if err := stream.Send(&syncpb.NodeFrame{Body: &syncpb.NodeFrame_Hello{Hello: hello}}); err != nil {
 		return err
 	}
