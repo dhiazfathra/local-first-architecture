@@ -203,20 +203,15 @@ func TestCompensationFlowsDownAndCannotBeRefused(t *testing.T) {
 		t.Fatalf("balance = %+v, want 6: the node applied the compensation", rows)
 	}
 	// A rejected over-receipt compensates with two events — the stock reversal and
-	// the paperwork reversal — so the projection records two exception rows; one of
-	// them carries the po_overreceipt reason.
+	// the paperwork reversal — but only the stock reversal is operator-visible: the
+	// paperwork correction carries no reason and no quantity of its own, so it
+	// would only be a second, misleading row for the same rejection.
 	exceptions, err := svc.Exceptions()
 	if err != nil {
 		t.Fatalf("Exceptions: %v", err)
 	}
-	foundOverReceipt := false
-	for _, e := range exceptions {
-		if e.Reason == domain.ReasonPOOverReceipt {
-			foundOverReceipt = true
-		}
-	}
-	if len(exceptions) != 2 || !foundOverReceipt {
-		t.Fatalf("exceptions = %+v, want two rows including one po_overreceipt row", exceptions)
+	if len(exceptions) != 1 || exceptions[0].Reason != domain.ReasonPOOverReceipt {
+		t.Fatalf("exceptions = %+v, want one po_overreceipt row", exceptions)
 	}
 	pulled, err := svc.Log().Cursor("pulled_from_central")
 	if err != nil {

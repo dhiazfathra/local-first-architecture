@@ -54,14 +54,6 @@ func TestExceptionsRecordCompensations(t *testing.T) {
 			wantReason: domain.ReasonDuplicateReceipt,
 			wantQty:    2,
 		},
-		{
-			name: "receipt line reversal has no reason field of its own",
-			event: domain.Event{Type: domain.TypeReceiptLineRecorded, AggregateID: "R1",
-				Payload: domain.ReceiptLineRecorded{ReceiptID: "R1", LineNo: 1, SKU: "WIDGET", LotID: "L1", QtyBase: -4}},
-			wantKind:   ExceptionCompensation,
-			wantReason: ReasonReceiptReversal,
-			wantQty:    0,
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -98,6 +90,31 @@ func TestExceptionsRecordCompensations(t *testing.T) {
 				t.Error("RecordedAt is zero")
 			}
 		})
+	}
+}
+
+// TestReceiptLineReversalIsNotItsOwnException covers the paperwork half of a
+// po_overreceipt rejection: central answers with both a StockAdjusted (the
+// stock reversal) and a ReceiptLineRecorded (the receipt paperwork correction)
+// sharing the same CausationID. Only the StockAdjusted is operator-visible —
+// it carries the reason and the quantity actually reversed. Surfacing the
+// paperwork correction too would show two exceptions for what is, from the
+// operator's point of view, one rejection.
+func TestReceiptLineReversalIsNotItsOwnException(t *testing.T) {
+	l, set := openSet(t)
+	origin := emit(t, l, set, received("WIDGET", "L1", "RECV-01", 10))[0]
+	reversal := domain.Event{Type: domain.TypeReceiptLineRecorded, AggregateID: "R1",
+		Payload: domain.ReceiptLineRecorded{ReceiptID: "R1", LineNo: 1, SKU: "WIDGET", LotID: "L1", QtyBase: -4}}
+	comp := emitCaused(t, l, set, origin.ID, reversal)[0]
+
+	rows, err := set.Exceptions()
+	if err != nil {
+		t.Fatalf("Exceptions: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == comp.ID.String() {
+			t.Fatalf("exception row = %+v, want none for a paperwork-only compensation", r)
+		}
 	}
 }
 

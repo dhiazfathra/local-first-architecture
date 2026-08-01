@@ -2,6 +2,7 @@ package projection
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -22,11 +23,6 @@ const (
 	// is an accepted outcome that a human resolves with a stock count.
 	ExceptionNegativeBalance ExceptionKind = "negative_balance"
 )
-
-// ReasonReceiptReversal is the reason recorded for a compensating
-// ReceiptLineRecorded. Unlike StockAdjusted that payload carries no reason field,
-// because the reason lives on the StockAdjusted emitted alongside it.
-const ReasonReceiptReversal = "receipt_line_reversal"
 
 // ExceptionRow is one operator-visible exception. ID is the compensating event's ID
 // for a compensation, and a key-derived identity for a negative balance, because a
@@ -61,23 +57,26 @@ func applyException(tx *sql.Tx, env domain.Envelope, payload any) error {
 }
 
 func recordCompensation(tx *sql.Tx, env domain.Envelope, payload any) error {
-	reason := ReasonReceiptReversal
-	if a, ok := payload.(domain.StockAdjusted); ok {
-		reason = a.Reason
+	a, ok := payload.(domain.StockAdjusted)
+	if !ok {
+		// A rejection can emit more than one compensating event sharing the same
+		// CausationID — po_overreceipt, for one, reverses the stock via a
+		// StockAdjusted and also books a negative ReceiptLineRecorded line to
+		// correct the paperwork. Only the StockAdjusted is operator-visible: it
+		// carries the reason and the quantity actually reversed. The paperwork
+		// correction has no stock effect of its own and would otherwise show up
+		// as a second, misleading exception row for the same rejection.
+		return nil
 	}
-	var key domain.StockKey
-	var qty float64
-	if moves := MovementsOf(payload); len(moves) > 0 {
-		key, qty = moves[0].FromKey(), moves[0].Qty
-		if key.Location == domain.External {
-			key = moves[0].ToKey()
-		}
+	key, qty := a.Move.FromKey(), a.Move.Qty
+	if key.Location == domain.External {
+		key = a.Move.ToKey()
 	}
 	_, err := tx.Exec(`INSERT INTO exceptions
 		(id, kind, reason, caused_by, sku, location, lot_id, qty, recorded_at, resolved)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
 		ON CONFLICT (id) DO NOTHING`,
-		env.ID.String(), string(ExceptionCompensation), reason, env.CausationID.String(),
+		env.ID.String(), string(ExceptionCompensation), a.Reason, env.CausationID.String(),
 		key.SKU, string(key.Location), key.LotID, qty, env.RecordedAt.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("record compensation %s: %w", env.ID, err)
@@ -102,12 +101,47 @@ func refreshNegatives(tx *sql.Tx, env domain.Envelope, payload any) error {
 	return nil
 }
 
+// touchKey records the highest RecordedAt seen for a key across every movement
+// that has ever touched it, regardless of the order those movements are applied
+// in: the update only ever advances the stored value, never lowers it, so
+// folding the same set of movements in a different order produces the same
+// final value. That is what refreshNegative needs, and a plain "stamp the
+// current envelope's RecordedAt" does not have: a node applies its own commands
+// the instant they are issued but only learns of a central compensation for an
+// earlier one later, on the next sync, so which movement is "last" for a key
+// depends on arrival order, not just on the log's content. Using the running
+// max instead means the negative-balance exception's recorded_at always comes
+// out the same, live or replayed — which is what the determinism check in
+// internal/integration/determinism_test.go relies on.
+func touchKey(tx *sql.Tx, k domain.StockKey, env domain.Envelope) (string, error) {
+	var recordedAt string
+	err := tx.QueryRow(`INSERT INTO key_touched (sku, location, lot_id, recorded_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (sku, location, lot_id) DO UPDATE SET recorded_at =
+			CASE WHEN excluded.recorded_at > key_touched.recorded_at
+				THEN excluded.recorded_at ELSE key_touched.recorded_at END
+		RETURNING recorded_at`,
+		k.SKU, string(k.Location), k.LotID, env.RecordedAt.UTC().Format(time.RFC3339Nano)).Scan(&recordedAt)
+	// Not covered: this INSERT..ON CONFLICT..RETURNING always yields exactly one
+	// row, so the only way Scan fails here is a closed/exhausted pool — the same
+	// class of fault left unexercised elsewhere in this file (see Exceptions and
+	// refreshNegative) as disproportionate to reproduce.
+	if err != nil {
+		return "", fmt.Errorf("touch key %+v: %w", k, err)
+	}
+	return recordedAt, nil
+}
+
 func refreshNegative(tx *sql.Tx, env domain.Envelope, k domain.StockKey) error {
 	var qty sql.NullFloat64
 	err := tx.QueryRow(`SELECT qty FROM stock_on_hand WHERE sku = ? AND location = ? AND lot_id = ?`,
 		k.SKU, string(k.Location), k.LotID).Scan(&qty)
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("read balance for negative check at %+v: %w", k, err)
+	}
+	recordedAt, err := touchKey(tx, k, env)
+	if err != nil {
+		return err
 	}
 	if qty.Float64 < 0 {
 		if _, err := tx.Exec(`INSERT INTO exceptions
@@ -115,8 +149,7 @@ func refreshNegative(tx *sql.Tx, env domain.Envelope, k domain.StockKey) error {
 			VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, 0)
 			ON CONFLICT (id) DO UPDATE SET qty = excluded.qty, recorded_at = excluded.recorded_at, resolved = 0`,
 			negativeID(k), string(ExceptionNegativeBalance), "negative_after_compensation",
-			k.SKU, string(k.Location), k.LotID, qty.Float64,
-			env.RecordedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+			k.SKU, string(k.Location), k.LotID, qty.Float64, recordedAt); err != nil {
 			return fmt.Errorf("flag negative balance at %+v: %w", k, err)
 		}
 		return nil

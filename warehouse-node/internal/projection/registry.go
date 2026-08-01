@@ -56,6 +56,14 @@ CREATE TABLE IF NOT EXISTS exceptions (
     resolved    INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS key_touched (
+    sku         TEXT NOT NULL,
+    location    TEXT NOT NULL,
+    lot_id      TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (sku, location, lot_id)
+);
+
 CREATE TABLE IF NOT EXISTS transfers (
     id            TEXT PRIMARY KEY,
     from_node     TEXT NOT NULL,
@@ -70,7 +78,7 @@ CREATE TABLE IF NOT EXISTS transfers (
 // projectionTables is every table Rebuild empties. Adding a projection means adding
 // its table here.
 var projectionTables = []string{
-	"stock_on_hand", "reservations", "exceptions", "transfers", "projection_applied",
+	"stock_on_hand", "reservations", "exceptions", "transfers", "key_touched", "projection_applied",
 }
 
 // Set is the collection of read models for one node, stored alongside its log.
