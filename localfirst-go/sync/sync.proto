@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package localfirst.sync.v1;
+
+option go_package = "github.com/dhiazfathra/local-first-architecture/localfirst-go/sync/syncpb";
+
+// Sync is symmetric: the same Frame type flows in both directions, because
+// with per-node ownership central is just a peer with a bigger disk.
+service Sync {
+  rpc Replicate(stream Frame) returns (stream Frame);
+}
+
+message Frame {
+  oneof body {
+    Hello hello = 1; // node id + version vector
+    Batch batch = 2; // records the peer lacks
+    Ack   ack   = 3; // version vector after apply
+  }
+}
+
+message Hello {
+  string node_id = 1;
+  map<string, uint64> version = 2;
+}
+
+message Batch {
+  repeated Record records = 1;
+}
+
+message Ack {
+  map<string, uint64> version = 1;
+}
+
+message Record {
+  string node_id     = 1;
+  uint64 seq         = 2;
+  int64  hlc_wall    = 3;
+  uint32 hlc_logical = 4;
+  string type        = 5;
+  bytes  payload     = 6;
+}
